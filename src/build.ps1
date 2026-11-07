@@ -169,7 +169,9 @@ if ($Distribuir) {
     Copy-Item (Join-Path $deps 'glslang-v3k\LICENSE.txt') "$dd\LICENCIAS\glslang.txt"
     Copy-Item (Join-Path $deps 'fmt\LICENSE') "$dd\LICENCIAS\fmt.txt"
     # código fuente (GPL): la copia del repositorio aparte, sin .git
-    $repo = Join-Path $root '..\..\..\VitaRE_repo'   # copia del código (tools\copiar_repo.ps1)
+    # el del repositorio público/privado de GitHub (solo launcher/port) si está; si no, la copia completa
+    $repo = Join-Path $root '..\..\..\ProjectBaseball'
+    if (-not (Test-Path $repo)) { $repo = Join-Path $root '..\..\..\VitaRE_repo' }
     if (Test-Path $repo) {
         $tmpz = Join-Path $env:TEMP 'mlb15_fuente'
         if (Test-Path $tmpz) { Remove-Item $tmpz -Recurse -Force }

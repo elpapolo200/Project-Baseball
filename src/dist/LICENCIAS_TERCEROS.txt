@@ -1,0 +1,32 @@
+Componentes de terceros incluidos en esta carpeta
+================================================
+
+herramientas\clang.exe, lld-link.exe, llvm-dlltool.exe, include\clang\
+    LLVM 19.1.7 (https://llvm.org). Licencia: Apache License v2.0 with LLVM
+    Exceptions. Texto completo: https://llvm.org/LICENSE.txt
+    Binarios oficiales sin modificar (LLVM-19.1.7-win64.exe).
+
+herramientas\realesrgan\
+    realesrgan-ncnn-vulkan (https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan),
+    licencia MIT, Copyright (c) 2021 Xintao Wang.
+    Modelo realesrgan-x4plus de Real-ESRGAN (https://github.com/xinntao/Real-ESRGAN),
+    licencia BSD 3-Clause, Copyright (c) 2021, Xintao Wang.
+    Usa ncnn (https://github.com/Tencent/ncnn), licencia BSD 3-Clause, Tencent.
+
+herramientas\armrecomp.exe, include\vitarecomp\
+    vitarecomp (licencia MIT, ver vitarecomp.txt) con cambios propios del port.
+
+herramientas\db\
+    Base de NIDs de vita-headers / vitasdk (licencia MIT, ver vita-headers.txt).
+
+SDL2.dll
+    SDL 2 (licencia zlib, ver SDL2.txt).
+
+msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll
+    Biblioteca de ejecución de Microsoft Visual C++ (archivos redistribuibles de
+    Visual Studio 2022).
+
+Dentro de MLB15.exe
+    - Traductor de shaders de Vita3K (GPL v2, ver GPL-2.0.txt): por eso el port es GPL v2.
+    - LibAtrac9 (MIT, ver LibAtrac9.txt), glslang (ver glslang.txt), SPIRV-Tools
+      (Apache 2.0), fmt (ver fmt.txt).

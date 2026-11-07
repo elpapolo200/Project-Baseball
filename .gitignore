@@ -1,0 +1,17 @@
+# Nunca subir nada del juego ni compilado
+*.elf
+eboot*.bin
+*.arc
+juego.dll
+*.obj
+*.lib
+*.exe
+*.res
+*.map
+*.pdb
+datos/
+frames/
+texturas/
+partes/
+herramientas/
+*.log

@@ -1,0 +1,108 @@
+Project Baseball - port nativo de MLB 15 The Show (PS Vita) para PC
+===================================================================
+
+Esto NO es el juego. Es un lanzador que convierte TU copia de MLB 15 The Show de
+PS Vita (PCSA00511) en un juego nativo de Windows, con mejoras: resolución hasta
+x4, 60 FPS, pantalla completa, suavizado, mando de Xbox, controles configurables
+y texturas HD opcionales.
+
+Esta carpeta no lleva nada del juego. Sin tu copia no funciona.
+
+
+Qué necesitas
+-------------
+- Windows 10 u 11 de 64 bits.
+- Una tarjeta gráfica con Vulkan (cualquier NVIDIA, AMD o Intel de los últimos
+  años, con los drivers al día).
+- 8 GB de RAM o más. La primera vez, unos 3 GB libres en el disco durante unos
+  minutos.
+- Tu copia del juego en el PC, de una de estas dos formas (solo una vez):
+  a) Con Vita3K (el emulador; no se usa para jugar, solo para descifrar):
+     instala el juego y haz clic derecho sobre MLB 15 The Show > "Decrypt All
+     SELF". El eboot.bin descifrado queda en
+     <carpeta de Vita3K>\cache\decrypted_selfs\PCSA00511\eboot.bin
+  b) Con tu PS Vita con homebrew (HENkaku/Enso): descifra el juego con FAGDec
+     (eboot.bin o eboot.elf) y copia al PC la carpeta ux0:app/PCSA00511 con
+     VitaShell usando "Open decrypted".
+  Si pones el eboot descifrado dentro de la carpeta PCSA00511 o junto a
+  ProjectBaseball.exe, el lanzador lo encuentra solo.
+
+
+Primera vez
+-----------
+1. Abre ProjectBaseball.exe.
+2. Elige la carpeta del juego: PCSA00511, la que contiene
+   VITA_COMPRESSED_WAD.arc. Con Vita3K suele estar en
+   %APPDATA%\Vita3K\Vita3K\ux0\app\PCSA00511
+3. Elige el eboot.bin descifrado (el del paso de "Decrypt All SELF").
+4. "Preparando MLB 15 para tu PC": el lanzador traduce y compila el juego a
+   partir de tu copia. Tarda de 5 a 30 minutos según el PC y solo pasa la
+   primera vez. Puedes minimizar la ventana.
+5. Sale la ventana del lanzador: elige las opciones y pulsa JUGAR.
+
+Después arranca directamente. Todo se guarda en ProjectBaseball.ini y en la carpeta datos
+(partidas guardadas incluidas). Si mueves la carpeta, muévela entera.
+
+
+Texturas HD (opcional)
+----------------------
+En el lanzador, "Crear texturas HD…" crea caras, uniformes y cuerpos de los
+jugadores al doble de resolución con IA (Real-ESRGAN, en tu tarjeta gráfica), a
+partir de tu copia. Tarda bastante (de media hora a varias horas). Puedes
+detenerlo y seguir otro día. Se guardan en la carpeta "texturas".
+
+
+Controles
+---------
+  Flechas ........... cruceta          X / Espacio ...... Cruz (aceptar)
+  C ................. Círculo (atrás)  Z / V ............ Cuadrado / Triángulo
+  Q / E ............. L / R            Enter / Shift dcho. Start / Select
+  WASD / IJKL ....... sticks           Mando de Xbox .... como en la Vita
+  Ratón ............. pantalla táctil (clic = tocar, arrastrar = deslizar)
+  F9 ................ resolución x1 a x4 (al reiniciar)
+  F10 ............... mostrar los FPS
+  F11 o Alt+Enter ... pantalla completa
+  Esc ............... salir de pantalla completa; en ventana, cierra el juego
+Las teclas se cambian en el lanzador con "Controles…".
+
+Portada (la pantalla con la pestaña "SWIPE"): pulsa Start (Enter) para entrar.
+
+Al abrir ProjectBaseball.exe: Ctrl muestra la ventana del lanzador aunque la hayas quitado;
+Shift vuelve a preguntar la carpeta del juego.
+
+
+Llevarlo a otro PC
+------------------
+Copia la carpeta entera (con datos). Si datos\eboot.elf y datos\juego.dll ya
+están, no hace falta el eboot.bin ni volver a preparar nada: solo vuelve a
+elegir la carpeta del juego si en ese PC está en otro sitio (Shift al abrir).
+
+
+Pantalla negra o muy lento (portátiles con gráficos integrados Intel/AMD)
+-----------------------------------------------------------------------
+- El port necesita Vulkan: actualiza el driver de la tarjeta desde la web de
+  Intel/AMD/NVIDIA (con Intel, el "Intel Driver & Support Assistant"). Si no hay
+  Vulkan, el lanzador avisa al abrir.
+- Con solo gráficos integrados el lanzador empieza en resolución x1 y 30 FPS.
+  Si aún va lento, quita el suavizado y las texturas HD. x2-x4 son para
+  tarjetas dedicadas.
+- Con dos tarjetas, ProjectBaseball.ini [video] tarjeta=0/1 elige cuál usar.
+
+
+Si algo falla
+-------------
+- El registro está en datos\log.txt.
+- Si la preparación falla, el detalle queda en datos\compilando\ (los .log).
+  Vuelve a abrir ProjectBaseball.exe para intentarlo otra vez.
+- Tu copia tiene que ser MLB 15 The Show de Vita PCSA00511 (versión americana) con
+  la misma versión que la del autor del port; con otra versión no funcionará.
+- Con el portátil a batería el juego va mucho más lento: enchúfalo.
+
+
+Licencias
+---------
+El port es software libre (GPL v2: usa código de Vita3K). Su código fuente va en
+codigo_fuente.zip. Las herramientas incluidas (LLVM/clang, Real-ESRGAN, SDL2...)
+tienen sus licencias en la carpeta LICENCIAS. MLB 15 The Show es de Sony
+Interactive Entertainment / San Diego Studio; este proyecto no tiene relación con
+ellos ni con la MLB, y no incluye ningún archivo del juego.

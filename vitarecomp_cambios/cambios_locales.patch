@@ -1,0 +1,3364 @@
+﻿diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d9c59f9..8fd07bb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -45,6 +45,8 @@ add_library(vitarecomp STATIC
+     src/dispatch.c
+     src/vfp.c
+     src/hle_libc.c
++    src/atomic.c
++    src/neon.c
+ )
+ 
+ target_include_directories(vitarecomp PUBLIC
+diff --git a/include/vitarecomp/cpu.h b/include/vitarecomp/cpu.h
+index b209751..2d75382 100644
+--- a/include/vitarecomp/cpu.h
++++ b/include/vitarecomp/cpu.h
+@@ -11,20 +11,77 @@
+ 
+ #include <stdint.h>
+ 
+-/* r0-r12, then the three with architectural meaning. r15 (PC) is deliberately
++/* MLB 15 port: the game runs many guest threads (render, kinematics, tasks,
++ * audio, streaming), so the machine state is per host thread. Every guest
++ * thread runs on its own host thread with its own registers. */
++#if defined(_MSC_VER)
++#define VITA_TLS __declspec(thread)
++#else
++#define VITA_TLS _Thread_local
++#endif
++
++/* MLB 15 port (2026-11-06): the whole machine state lives in one per-thread
++ * struct so the recompiled game can be a separate DLL built on the player's PC
++ * (nothing of the game is distributed). The state belongs to whichever image
++ * runs the generated code:
++ *   VITA_CPU_PROPIA  the game DLL: direct TLS access, as fast as before;
++ *   VITA_CPU_REMOTA  the host exe: reaches the DLL's TLS through a pointer
++ *                    cached per thread (vita_cpu_alta asks the DLL once);
++ *   neither          classic static link (cpu.c defines it).
++ * r0-r12, then the three with architectural meaning. r15 (PC) is deliberately
+  * absent: a recompiled program has no program counter, and any instruction
+- * that genuinely reads PC has its value resolved at translation time. */
+-extern uint32_t r0, r1, r2, r3, r4, r5, r6, r7;
+-extern uint32_t r8, r9, r10, r11, r12;
+-extern uint32_t sp, lr;
++ * that genuinely reads PC has its value resolved at translation time.
++ * NZCV are held as separate ints rather than packed into a CPSR word. */
++typedef union {
++    uint32_t u;
++    float    f;
++} vfp_reg;
+ 
+-/* NZCV, held as separate ints rather than packed into a CPSR word.
+- *
+- * ARM leans on these far harder than MIPS does ΓÇö a comparison and its branch
+- * are separate instructions with arbitrary distance between them, and carry
+- * feeds ADC/SBC chains. Keeping them unpacked means the compiler can usually
+- * fold a flag write into the operation that produced it, and it makes the
+- * generated C readable. */
+-extern int flag_n, flag_z, flag_c, flag_v;
++typedef struct {
++    uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, sp, lr;
++    int flag_n, flag_z, flag_c, flag_v;
++    int fpscr_n, fpscr_z, fpscr_c, fpscr_v;
++    vfp_reg vfp_s[64];
++} vita_cpu_state;
++
++#if defined(VITA_CPU_REMOTA)
++extern VITA_TLS vita_cpu_state *vita_cpu_p;
++vita_cpu_state *vita_cpu_alta(void);
++/* The DLL's function returning its per-thread state (set after LoadLibrary). */
++extern vita_cpu_state *(*vita_cpu_fuente)(void);
++static inline vita_cpu_state *vita_cpu_actual(void) {
++    vita_cpu_state *p = vita_cpu_p;
++    return p ? p : vita_cpu_alta();
++}
++#define VITA_CPU (*vita_cpu_actual())
++#else
++extern VITA_TLS vita_cpu_state vita_cpu;
++#define VITA_CPU vita_cpu
++#endif
++
++#define r0  (VITA_CPU.r0)
++#define r1  (VITA_CPU.r1)
++#define r2  (VITA_CPU.r2)
++#define r3  (VITA_CPU.r3)
++#define r4  (VITA_CPU.r4)
++#define r5  (VITA_CPU.r5)
++#define r6  (VITA_CPU.r6)
++#define r7  (VITA_CPU.r7)
++#define r8  (VITA_CPU.r8)
++#define r9  (VITA_CPU.r9)
++#define r10 (VITA_CPU.r10)
++#define r11 (VITA_CPU.r11)
++#define r12 (VITA_CPU.r12)
++#define sp  (VITA_CPU.sp)
++#define lr  (VITA_CPU.lr)
++#define flag_n (VITA_CPU.flag_n)
++#define flag_z (VITA_CPU.flag_z)
++#define flag_c (VITA_CPU.flag_c)
++#define flag_v (VITA_CPU.flag_v)
++#define fpscr_n (VITA_CPU.fpscr_n)
++#define fpscr_z (VITA_CPU.fpscr_z)
++#define fpscr_c (VITA_CPU.fpscr_c)
++#define fpscr_v (VITA_CPU.fpscr_v)
++#define vfp_s (VITA_CPU.vfp_s)
+ 
+ #endif /* VITARECOMP_CPU_H */
+diff --git a/include/vitarecomp/dispatch.h b/include/vitarecomp/dispatch.h
+index 6c91821..795e3ef 100644
+--- a/include/vitarecomp/dispatch.h
++++ b/include/vitarecomp/dispatch.h
+@@ -42,6 +42,12 @@ void vita_dispatch(uint32_t from, uint32_t addr);
+  * for telling "the table is incomplete" from "the program went somewhere it
+  * should not have". */
+ uint32_t vita_dispatch_hits(void);
++
++/* Host overrides for indirect transfers: `fn` runs instead of the recompiled
++ * function at `addr` (it may call the original, from vita_dispatch_lookup).
++ * Direct calls (BL) are static C calls and do not pass through here. */
++int     vita_dispatch_override(uint32_t addr, vita_fn fn);
++vita_fn vita_dispatch_lookup(uint32_t addr);
+ uint32_t vita_dispatch_misses(void);
+ 
+ #endif /* VITARECOMP_DISPATCH_H */
+diff --git a/include/vitarecomp/hle.h b/include/vitarecomp/hle.h
+index 77b0c83..db4b66f 100644
+--- a/include/vitarecomp/hle.h
++++ b/include/vitarecomp/hle.h
+@@ -34,6 +34,12 @@
+  * called, rather than quietly allocating over something. */
+ void vita_heap_init(uint32_t base, uint32_t size);
+ 
++/* MLB 15 port: read SceLibcParam from the module's SceProcessParam (guest
++ * address), run its malloc/TLS init functions the way SceLibc does at load,
++ * and route malloc/free/calloc/realloc/memalign/new/delete to the module's
++ * own allocator from then on. */
++void vita_libc_init(uint32_t process_param);
++
+ /* Bytes handed out and the high-water mark, for telling "the program leaks"
+  * from "the heap was too small". */
+ uint32_t vita_heap_used(void);
+diff --git a/include/vitarecomp/recomp_rt.h b/include/vitarecomp/recomp_rt.h
+index f1f199d..61d927a 100644
+--- a/include/vitarecomp/recomp_rt.h
++++ b/include/vitarecomp/recomp_rt.h
+@@ -12,6 +12,7 @@
+ #include "cpu.h"
+ #include "mem.h"
+ #include "vfp.h"
++#include "neon.h"
+ 
+ #include <math.h>
+ 
+@@ -122,6 +123,42 @@ static inline uint32_t vita_rev(uint32_t v) {
+     return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8)
+          | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+ }
++/* Carry out of the barrel shifter: the last bit shifted out. `type` is
++ * LSL/LSR/ASR/ROR (0-3); a shift of 0 leaves the carry `c` unchanged. Needed
++ * because `lsls r0, r0, #n` followed by `bcs` is how compiled code tests a bit. */
++static inline int vita_shift_c(int type, uint32_t x, uint32_t s, int c) {
++    if (s == 0) return c;
++    switch (type) {
++        case 0:  return s > 32 ? 0 : (int)((x >> (32 - s)) & 1);
++        case 1:  return s > 32 ? 0 : (int)((x >> (s - 1)) & 1);
++        case 2:  return s >= 32 ? (int)(x >> 31) : (int)((x >> (s - 1)) & 1);
++        default: {
++            uint32_t r = s & 31;
++            uint32_t v = r ? (x >> r) | (x << (32 - r)) : x;
++            return (int)(v >> 31);
++        }
++    }
++}
++
++static inline uint32_t vita_rev16(uint32_t v) {
++    return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
++}
++static inline uint32_t vita_revsh(uint32_t v) {
++    return (uint32_t)(int32_t)(int16_t)(((v & 0xFF) << 8) | ((v >> 8) & 0xFF));
++}
++/* CLZ of zero is 32 on ARM; the compiler builtins leave it undefined. */
++static inline uint32_t vita_clz(uint32_t v) {
++    uint32_t n = 0;
++    if (!v) return 32;
++    while (!(v & 0x80000000u)) { v <<= 1; n++; }
++    return n;
++}
++static inline uint32_t vita_rbit(uint32_t v) {
++    v = ((v >> 1) & 0x55555555u) | ((v & 0x55555555u) << 1);
++    v = ((v >> 2) & 0x33333333u) | ((v & 0x33333333u) << 2);
++    v = ((v >> 4) & 0x0F0F0F0Fu) | ((v & 0x0F0F0F0Fu) << 4);
++    return vita_rev(v);
++}
+ 
+ /* --- bitfields ---------------------------------------------------------------
+  *
+@@ -170,6 +207,21 @@ void vita_trap_import(uint32_t addr, uint32_t nid, const char *name);
+ /* Total traps hit. Only meaningful under VITARECOMP_TRACE=1, where execution
+  * continues past them; otherwise the first one ends the program. */
+ uint32_t vita_trap_count(void);
++/* Exclusive access (LDREX/STREX): `size` is 1, 2 or 4. strex returns 0 when
++ * the store happened, 1 when the reservation was lost. */
++uint32_t vita_ldrex(uint32_t addr, int size);
++uint32_t vita_strex(uint32_t addr, uint32_t value, int size);
++void vita_clrex(void);
++
++/* Imported firmware VARIABLES (SceLibc's _Ctype, _Stdout, ...), emitted by
++ * armrecomp: each has a cell in guest memory that the module's MOVW/MOVT pairs
++ * address. The host writes the variable there before module_start. */
++typedef struct { uint32_t lib_nid, nid, cell; } vita_import_var;
++extern const vita_import_var vita_import_vars[];
++extern const uint32_t vita_import_var_count;
++
++/* Optional host callback run before a fatal trap aborts (e.g. a native backtrace). */
++extern void (*vita_trap_hook)(void);
+ 
+ #endif /* VITARECOMP_RECOMP_RT_H */
+ 
+diff --git a/include/vitarecomp/vfp.h b/include/vitarecomp/vfp.h
+index dfadabc..4bead75 100644
+--- a/include/vitarecomp/vfp.h
++++ b/include/vitarecomp/vfp.h
+@@ -8,10 +8,13 @@
+  * anyone writes a line of vector code.
+  *
+  * The register file is 32 single-precision registers, S0-S31. The same storage
+- * is also addressable as 16 double-precision registers, D0-D15, where Dn
+- * occupies S(2n) and S(2n+1) with S(2n) holding the LOW half. Keeping one
+- * backing array rather than two makes that aliasing automatic instead of
+- * something to remember at every access.
++ * is also addressable as double-precision registers, where Dn occupies S(2n)
++ * and S(2n+1) with S(2n) holding the LOW half. Keeping one backing array rather
++ * than two makes that aliasing automatic instead of something to remember at
++ * every access.
++ *
++ * The Vita's Cortex-A9 has VFPv3-D32: D16-D31 exist too (NEON and compilers use
++ * them), with no single-precision alias. They are words 32-63 of the array.
+  */
+ 
+ #ifndef VITARECOMP_VFP_H
+@@ -20,15 +23,14 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
++#include "vitarecomp/cpu.h" /* VITA_TLS */
++
+ /* Accessed as bits or as a float depending on the instruction, so a union
+  * rather than a cast: type-punning through a pointer is undefined behaviour
+  * and compilers do miscompile it at higher optimisation levels. */
+-typedef union {
+-    uint32_t u;
+-    float    f;
+-} vfp_reg;
++/* vfp_reg: cpu.h */
+ 
+-extern vfp_reg vfp_s[32];
++/* (in vita_cpu_state, cpu.h) */
+ 
+ /* VFP comparisons write FPSCR, not the integer flags. A separate VMRS then
+  * copies them into APSR, and only after that can a conditional branch see
+@@ -36,7 +38,7 @@ extern vfp_reg vfp_s[32];
+  * recompiler that folds the comparison straight into the integer flags gets
+  * the right answer right up until code compares two floats, does integer work,
+  * and only then branches. */
+-extern int fpscr_n, fpscr_z, fpscr_c, fpscr_v;
++/* (in vita_cpu_state, cpu.h) */
+ 
+ static inline float vfp_getf(int n) { return vfp_s[n & 31].f; }
+ static inline void  vfp_setf(int n, float v) { vfp_s[n & 31].f = v; }
+@@ -46,7 +48,7 @@ static inline void     vfp_setu(int n, uint32_t v) { vfp_s[n & 31].u = v; }
+ 
+ /* Doubles occupy a register pair, low half first. */
+ static inline double vfp_getd(int n) {
+-    uint32_t lo = vfp_s[(n * 2) & 31].u, hi = vfp_s[(n * 2 + 1) & 31].u;
++    uint32_t lo = vfp_s[(n * 2) & 63].u, hi = vfp_s[(n * 2 + 1) & 63].u;
+     uint64_t bits = ((uint64_t)hi << 32) | lo;
+     double d;
+     memcpy(&d, &bits, sizeof(d));
+@@ -56,8 +58,23 @@ static inline double vfp_getd(int n) {
+ static inline void vfp_setd(int n, double v) {
+     uint64_t bits;
+     memcpy(&bits, &v, sizeof(bits));
+-    vfp_s[(n * 2) & 31].u     = (uint32_t)bits;
+-    vfp_s[(n * 2 + 1) & 31].u = (uint32_t)(bits >> 32);
++    vfp_s[(n * 2) & 63].u     = (uint32_t)bits;
++    vfp_s[(n * 2 + 1) & 63].u = (uint32_t)(bits >> 32);
++}
++
++/* VCVT float -> integer saturates on ARM (NaN gives 0); in C an out-of-range
++ * conversion is undefined and x64 returns 0x80000000. `x` is already rounded
++ * or truncated as the instruction requires. */
++static inline uint32_t vfp_cvt_s32(double x) {
++    if (x != x) return 0;
++    if (x >= 2147483647.0) return 0x7FFFFFFFu;
++    if (x <= -2147483648.0) return 0x80000000u;
++    return (uint32_t)(int32_t)x;
++}
++static inline uint32_t vfp_cvt_u32(double x) {
++    if (x != x || x <= 0.0) return 0;
++    if (x >= 4294967295.0) return 0xFFFFFFFFu;
++    return (uint32_t)x;
+ }
+ 
+ /* Compare two floats and write FPSCR.
+diff --git a/src/cpu.c b/src/cpu.c
+index 741c3cc..044805c 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -1,9 +1,15 @@
+-/* cpu.c ΓÇö the machine state the generated C operates on. */
++/* cpu.c ΓÇö the machine state the generated C operates on (see cpu.h). */
+ 
+ #include "vitarecomp/cpu.h"
+ 
+-uint32_t r0, r1, r2, r3, r4, r5, r6, r7;
+-uint32_t r8, r9, r10, r11, r12;
+-uint32_t sp, lr;
+-
+-int flag_n, flag_z, flag_c, flag_v;
++#if defined(VITA_CPU_REMOTA)
++VITA_TLS vita_cpu_state *vita_cpu_p;
++vita_cpu_state *(*vita_cpu_fuente)(void);
++static VITA_TLS vita_cpu_state vita_cpu_local;   /* until the game DLL is loaded */
++vita_cpu_state *vita_cpu_alta(void) {
++    if (!vita_cpu_fuente) return &vita_cpu_local;
++    return vita_cpu_p = vita_cpu_fuente();
++}
++#else
++VITA_TLS vita_cpu_state vita_cpu;
++#endif
+diff --git a/src/dispatch.c b/src/dispatch.c
+index 0465bec..2b0e8a2 100644
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -9,6 +9,34 @@ static const vita_dispatch_entry *g_table;
+ static uint32_t g_count;
+ static uint32_t g_hits, g_misses;
+ 
++/* Overrides set by the host: checked before the table, so a host function can
++ * stand in for (or wrap) a recompiled one on indirect calls. A handful at most,
++ * so a linear scan; with none set the cost is one compare. */
++#define MAX_OVERRIDES 32
++static vita_dispatch_entry g_over[MAX_OVERRIDES];
++static uint32_t g_nover;
++
++int vita_dispatch_override(uint32_t addr, vita_fn fn) {
++    addr &= ~1u;
++    for (uint32_t i = 0; i < g_nover; i++)
++        if (g_over[i].addr == addr) { g_over[i].fn = fn; return 1; }
++    if (g_nover >= MAX_OVERRIDES) return 0;
++    g_over[g_nover].addr = addr;
++    g_over[g_nover].fn = fn;
++    g_nover++;
++    return 1;
++}
++
++vita_fn vita_dispatch_lookup(uint32_t addr) {
++    uint32_t key = addr & ~1u, lo = 0, hi = g_count;
++    while (lo < hi) {
++        uint32_t mid = lo + (hi - lo) / 2;
++        if (g_table[mid].addr == key) return g_table[mid].fn;
++        if (g_table[mid].addr < key) lo = mid + 1; else hi = mid;
++    }
++    return 0;
++}
++
+ void vita_dispatch_init(const vita_dispatch_entry *table, uint32_t count) {
+     g_table = table;
+     g_count = count;
+@@ -40,6 +68,9 @@ void vita_dispatch(uint32_t from, uint32_t addr) {
+      * code carries it, so failing to mask means every lookup misses by one. */
+     uint32_t key = addr & ~1u;
+ 
++    for (uint32_t i = 0; i < g_nover; i++)
++        if (g_over[i].addr == key) { g_hits++; g_over[i].fn(); return; }
++
+     uint32_t lo = 0, hi = g_count;
+     while (lo < hi) {
+         uint32_t mid = lo + (hi - lo) / 2;
+diff --git a/src/hle_libc.c b/src/hle_libc.c
+index ffd29a0..d9693ae 100644
+--- a/src/hle_libc.c
++++ b/src/hle_libc.c
+@@ -11,9 +11,13 @@
+  * See hle.h for the calling convention and the link-order requirement.
+  */
+ 
++#include "vitarecomp/cpu.h"
++#include "vitarecomp/dispatch.h"
+ #include "vitarecomp/hle.h"
++#include "vitarecomp/mem.h"
+ #include "vitarecomp/recomp_rt.h"
+ 
++#include <stdio.h>
+ #include <string.h>
+ 
+ /* --- the guest/host boundary ------------------------------------------------ */
+@@ -115,7 +119,28 @@ void vita_heap_init(uint32_t base, uint32_t size) {
+ uint32_t vita_heap_used(void) { return g_heap_used; }
+ uint32_t vita_heap_size(void) { return g_heap_size; }
+ 
++/* MLB 15 port: guest threads run in parallel, so the cursor is behind a lock. */
++#if defined(_MSC_VER)
++#include <intrin.h>
++static volatile long g_heap_lock;
++static void heap_lock(void)   { while (_InterlockedExchange(&g_heap_lock, 1)) _mm_pause(); }
++static void heap_unlock(void) { _InterlockedExchange(&g_heap_lock, 0); }
++#else
++static volatile int g_heap_lock;
++static void heap_lock(void)   { while (__sync_lock_test_and_set(&g_heap_lock, 1)) { } }
++static void heap_unlock(void) { __sync_lock_release(&g_heap_lock); }
++#endif
++
++static uint32_t heap_alloc_locked(uint32_t n);
++
+ static uint32_t heap_alloc(uint32_t n) {
++    heap_lock();
++    uint32_t at = heap_alloc_locked(n);
++    heap_unlock();
++    return at;
++}
++
++static uint32_t heap_alloc_locked(uint32_t n) {
+     if (!g_heap_size) { vita_trap_unimpl(0, n, "malloc before vita_heap_init"); return 0; }
+ 
+     /* Align the OFFSET, not just the size. Rounding sizes up keeps the cursor
+@@ -133,14 +158,99 @@ static uint32_t heap_alloc(uint32_t n) {
+     return g_heap_base + at_off;
+ }
+ 
++/* --- the module's own allocator (SceLibcParam) --------------------------------
++ *
++ * MLB 15 port. A module can replace libc's malloc and C++'s new/delete by
++ * pointing SceLibcParam at tables of its own functions; the real SceLibc then
++ * calls malloc_init at load and routes every allocation through them. MLB 15
++ * does exactly that, and a static constructor waits for its malloc_init to
++ * have run. So: read the tables, run the init functions the way SceLibc would,
++ * and from then on forward to the guest's own allocator. The bump allocator
++ * below stays as the fallback for modules that do not replace anything.
++ *
++ * Table layouts (after u32 size, u32 version):
++ *   malloc:  init, finalize, malloc, free, calloc, realloc, memalign,
++ *            reallocalign, malloc_stats, malloc_stats_fast, malloc_usable_size
++ *   new:     new, new(nothrow), new[], new[](nothrow),
++ *            delete, delete(nothrow), delete[], delete[](nothrow)
++ *   tls:     init, finalize, malloc, free
++ */
++
++enum { MR_INIT, MR_FINI, MR_MALLOC, MR_FREE, MR_CALLOC, MR_REALLOC, MR_MEMALIGN,
++       MR_REALLOCALIGN, MR_STATS, MR_STATS_FAST, MR_USABLE, MR_COUNT };
++enum { NR_NEW, NR_NEW_NT, NR_NEW_ARR, NR_NEW_ARR_NT,
++       NR_DEL, NR_DEL_NT, NR_DEL_ARR, NR_DEL_ARR_NT, NR_COUNT };
++
++static uint32_t g_malloc_fn[MR_COUNT];
++static uint32_t g_new_fn[NR_COUNT];
++static uint32_t g_tls_fn[4];
++
++static void read_fn_table(uint32_t table, uint32_t *out, int max) {
++    uint32_t size = vita_read32(table);
++    int n = size >= 8 ? (int)((size - 8) / 4) : 0;
++    if (n > max) n = max;
++    for (int i = 0; i < n; i++) out[i] = vita_read32(table + 8 + 4u * (uint32_t)i);
++}
++
++void vita_libc_init(uint32_t process_param) {
++    uint32_t libc = vita_read32(process_param + 0x2C);
++    if (!libc) return;
++    uint32_t size = vita_read32(libc);
++    uint32_t malloc_tbl = vita_read32(libc + 0x20);
++    uint32_t new_tbl    = vita_read32(libc + 0x24);
++    uint32_t tls_tbl    = size >= 0x38 ? vita_read32(libc + 0x34) : 0;
++    if (new_tbl) read_fn_table(new_tbl, g_new_fn, NR_COUNT);
++    if (malloc_tbl) {
++        read_fn_table(malloc_tbl, g_malloc_fn, MR_COUNT);
++        if (g_malloc_fn[MR_INIT]) vita_dispatch(malloc_tbl, g_malloc_fn[MR_INIT]);
++    }
++    if (tls_tbl) {
++        read_fn_table(tls_tbl, g_tls_fn, 4);
++        if (g_tls_fn[0]) vita_dispatch(tls_tbl, g_tls_fn[0]);
++    }
++}
++
++/* Forward to the guest function if the module supplied one. Arguments are
++ * already in r0-r3 and the result comes back in r0. */
++static int forward(uint32_t fn) {
++    if (!fn) return 0;
++    vita_dispatch(0, fn);
++    return 1;
++}
++
+ void vita_hle_malloc(void) {
++    if (forward(g_malloc_fn[MR_MALLOC])) return;
+     uint32_t n = r0;
+     r0 = n ? heap_alloc(n) : 0u;
+ }
+ 
+-void vita_hle_free(void) { /* bump allocator: nothing to return */ }
++void vita_hle_free(void) {
++    forward(g_malloc_fn[MR_FREE]); /* bump allocator: nothing to return */
++}
++
++void vita_hle_calloc(void) {
++    if (forward(g_malloc_fn[MR_CALLOC])) return;
++    uint32_t n = r0 * r1;
++    uint32_t at = n ? heap_alloc(n) : 0u;
++    void *p = at ? gp(at, n, "calloc") : NULL;
++    if (p) memset(p, 0, n);
++    r0 = at;
++}
++
++void vita_hle_memalign(void) {
++    if (forward(g_malloc_fn[MR_MEMALIGN])) return;
++    uint32_t align = r0 ? r0 : 8u, n = r1;
++    uint32_t at = heap_alloc(n + align);
++    r0 = at ? (at + align - 1u) & ~(align - 1u) : 0u;
++}
++
++void vita_hle__Znwj(void)  { if (!forward(g_new_fn[NR_NEW]))     vita_hle_malloc(); }
++void vita_hle__Znaj(void)  { if (!forward(g_new_fn[NR_NEW_ARR])) vita_hle_malloc(); }
++void vita_hle__ZdlPv(void) { if (!forward(g_new_fn[NR_DEL]))     vita_hle_free(); }
++void vita_hle__ZdaPv(void) { if (!forward(g_new_fn[NR_DEL_ARR])) vita_hle_free(); }
+ 
+ void vita_hle_realloc(void) {
++    if (forward(g_malloc_fn[MR_REALLOC])) return;
+     uint32_t old = r0, n = r1;
+     if (!n)   { r0 = 0; return; }
+     if (!old) { r0 = heap_alloc(n); return; }
+@@ -163,8 +273,31 @@ void vita_hle_realloc(void) {
+  * Sizes are known up front, so these are a bounds check and a host call.
+  */
+ 
++/* Destination the guest cannot back: when the embedder sets this (the MLB15
++ * port does, for a garbage pointer in the 3D crowd code) the copy is skipped
++ * and reported instead of trapping. Off by default: a trap names the bug. */
++int vita_libc_skip_bad_dst = 0;
++/* Optional: called (with the guest registers live) each time a copy is skipped. */
++void (*vita_libc_bad_dst_hook)(uint32_t addr, uint32_t len) = 0;
++
++static void *gp_dst(uint32_t addr, uint32_t len, const char *who) {
++    if (len == 0) return NULL;
++    void *p = vita_mem_ptr(addr, len);
++    if (!p && vita_libc_skip_bad_dst) {
++        static int told;
++        if (told++ < 20) {
++            printf("vitarecomp: %s 0x%08X (%u bytes) not backed: skipped (lr=0x%08X)\n", who, addr, len, lr);
++            if (vita_libc_bad_dst_hook) vita_libc_bad_dst_hook(addr, len);
++            fflush(stdout);
++        }
++        return NULL;
++    }
++    if (!p) vita_trap_unimpl(addr, len, who);
++    return p;
++}
++
+ void vita_hle_memcpy(void) {
+-    void *d = gp(r0, r2, "memcpy dst"), *s = gp(r1, r2, "memcpy src");
++    void *d = gp_dst(r0, r2, "memcpy dst"), *s = d ? gp(r1, r2, "memcpy src") : NULL;
+     /* memmove, not memcpy: the guest may hand over overlapping regions, and
+      * while ARM's memcpy is equally undefined there, the host's would corrupt
+      * rather than trap and the bug would surface far away. */
+@@ -173,12 +306,12 @@ void vita_hle_memcpy(void) {
+ }
+ 
+ void vita_hle_memmove(void) {
+-    void *d = gp(r0, r2, "memmove dst"), *s = gp(r1, r2, "memmove src");
++    void *d = gp_dst(r0, r2, "memmove dst"), *s = d ? gp(r1, r2, "memmove src") : NULL;
+     if (d && s) memmove(d, s, r2);
+ }
+ 
+ void vita_hle_memset(void) {
+-    void *d = gp(r0, r2, "memset");
++    void *d = gp_dst(r0, r2, "memset");
+     if (d) memset(d, (int)(r1 & 0xFF), r2);
+ }
+ 
+diff --git a/src/trap.c b/src/trap.c
+index 4eb9ab7..91e191c 100644
+--- a/src/trap.c
++++ b/src/trap.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "vitarecomp/recomp_rt.h"
++#include "vitarecomp/cpu.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -51,6 +52,19 @@ static int first_time(uint32_t key) {
+ 
+ uint32_t vita_trap_count(void) { return g_hits; }
+ 
++/* Set by the host to add its own context (a native backtrace) to a fatal trap. */
++void (*vita_trap_hook)(void);
++
++/* Guest registers at the moment of a fatal trap: the first thing anyone wants
++ * when an indirect transfer lands on zero. */
++static void fatal_context(void) {
++    fprintf(stderr, "  r0=%08X r1=%08X r2=%08X r3=%08X r4=%08X r5=%08X r6=%08X\n"
++                    "  r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r12=%08X sp=%08X lr=%08X\n",
++            r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, sp, lr);
++    fflush(stderr);
++    if (vita_trap_hook) vita_trap_hook();
++}
++
+ void vita_trap_unimpl(uint32_t addr, uint32_t raw, const char *what) {
+     g_hits++;
+     if (trace_on()) {
+@@ -62,6 +76,7 @@ void vita_trap_unimpl(uint32_t addr, uint32_t raw, const char *what) {
+     fprintf(stderr,
+             "vitarecomp: untranslated instruction at 0x%08X (raw 0x%08X): %s\n",
+             addr, raw, what ? what : "?");
++    fatal_context();
+     abort();
+ }
+ 
+@@ -75,6 +90,7 @@ void vita_trap_indirect(uint32_t addr, uint32_t target) {
+     fprintf(stderr,
+             "vitarecomp: unresolved indirect transfer at 0x%08X -> 0x%08X\n",
+             addr, target);
++    fatal_context();
+     abort();
+ }
+ 
+@@ -97,5 +113,6 @@ void vita_trap_import(uint32_t addr, uint32_t nid, const char *name) {
+             "vitarecomp: unimplemented firmware import %s"
+             " at 0x%08X (NID 0x%08X)\n",
+             name, addr, nid);
++    fatal_context();
+     abort();
+ }
+diff --git a/src/vfp.c b/src/vfp.c
+index 24dc440..f90cc61 100644
+--- a/src/vfp.c
++++ b/src/vfp.c
+@@ -3,8 +3,7 @@
+ #include "vitarecomp/vfp.h"
+ #include "vitarecomp/cpu.h"
+ 
+-vfp_reg vfp_s[32];
+-int fpscr_n, fpscr_z, fpscr_c, fpscr_v;
++/* vfp_s and fpscr_*: vita_cpu_state (cpu.h, cpu.c) */
+ 
+ /* ARM's four comparison outcomes, written as the architecture defines them
+  * rather than derived from C's operators ΓÇö C has no way to express "unordered"
+diff --git a/tests/test_decode.c b/tests/test_decode.c
+index e2ce090..d3afa5e 100644
+--- a/tests/test_decode.c
++++ b/tests/test_decode.c
+@@ -262,7 +262,123 @@ static void test_t32_operands(void) {
+ 
+     put16(0, 0xE8B1); put16(2, 0x0030);      /* ldm r1!, {r4,r5} ├óΓé¼ΓÇ¥ base r1 */
+     in = dec(ARM_T32, BASE);
+-    assert(in.cls == A_LOADM && in.op == OP_NONE);
++    assert(in.cls == A_LOADM && in.op == OP_LDM && in.rn == 1 && in.writeback && !in.ldm_db);
++
++    put16(0, 0xE8BD); put16(2, 0x83F0);      /* pop.w {r4-r9,pc}: a return that restores */
++    in = dec(ARM_T32, BASE);
++    assert(in.cls == A_RETURN && in.op == OP_POP && in.reglist == 0x83F0);
++
++    put16(0, 0xE858); put16(2, 0x0F00);      /* ldrex r0, [r8] */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_LDREX && in.rt == 0 && in.rn == 8 && in.ex_size == 4);
++
++    put16(0, 0xE848); put16(2, 0x1200);      /* strex r2, r1, [r8] */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_STREX && in.rd == 2 && in.rt == 1 && in.rn == 8);
++
++    put16(0, 0xFB01); put16(2, 0x3002);      /* mla r0, r1, r2, r3 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_MLA && in.rd == 0 && in.rn == 1 && in.rm == 2 && in.rt == 3);
++
++    put16(0, 0xFBA1); put16(2, 0x0302);      /* umull r0, r3, r1, r2 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_UMULL && in.rt == 0 && in.rt2 == 3 && in.rn == 1 && in.rm == 2);
++
++    put16(0, 0xF3BF); put16(2, 0x8F5F);      /* dmb sy */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_BARRIER);
++
++    put16(0, 0xF850); put16(2, 0x0028);      /* ldr.w r0, [r0, r8, lsl #2] */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_LDR && in.rn == 0 && in.rm == 8 && in.shift_amt == 2 && in.idx_mode == 0);
++
++    put16(0, 0xF84D); put16(2, 0x0D04);      /* str r0, [sp, #-4]! */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_STR && in.rn == 13 && in.imm == 4 && !in.mem_add && in.idx_mode == 1);
++
++    put16(0, 0xF851); put16(2, 0x0B04);      /* ldr r0, [r1], #4 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_LDR && in.rn == 1 && in.imm == 4 && in.mem_add && in.idx_mode == 2);
++
++    put16(0, 0xF854); put16(2, 0x4C04);      /* ldr r4, [r4, #-4] */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_LDR && in.imm == 4 && !in.mem_add && in.idx_mode == 0);
++
++    put16(0, 0xE9ED); put16(2, 0x4502);      /* strd r4, r5, [sp, #8]! */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_STRD && in.idx_mode == 1 && in.imm == 8);
++
++    put16(0, 0xE8FD); put16(2, 0x4502);      /* ldrd r4, r5, [sp], #8 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_LDRD && in.idx_mode == 2 && in.imm == 8 && in.mem_add);
++
++    put16(0, 0xFAB1); put16(2, 0xF181);      /* clz r1, r1 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_CLZ && in.rd == 1 && in.rm == 1);
++
++    put16(0, 0xFA92); put16(2, 0xF3A2);      /* rbit r3, r2 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_RBIT && in.rd == 3 && in.rm == 2);
++
++    put16(0, 0xEE21); put16(2, 0x0A42);      /* vnmul.f32 s0, s2, s4 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VNMUL);
++
++    put16(0, 0xEE11); put16(2, 0x0A42);      /* vnmla.f32 s0, s2, s4 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VNMLA);
++
++    put16(0, 0xEE21); put16(2, 0x0A02);      /* vmul.f32 s0, s2, s4 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VMUL);
++
++    put16(0, 0xECC0); put16(2, 0x0B04);      /* vstmia r0, {d16-d17} (no writeback) */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VSTM && !in.writeback && in.imm == 2 && in.vd == 16);
++
++    put16(0, 0xFA5F); put16(2, 0xFA94);      /* uxtb.w sl, r4, ror #8 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_UXTB && in.rd == 10 && in.rm == 4 && in.shift_amt == 8 && in.rn == ARM_NO_REG);
++
++    put16(0, 0xFA5F); put16(2, 0xFBA4);      /* uxtb.w fp, r4, ror #16 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_UXTB && in.rd == 11 && in.shift_amt == 16);
++
++    put16(0, 0xFA4F); put16(2, 0xF081);      /* sxtb.w r0, r1 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_SXTB && in.rd == 0 && in.rm == 1 && in.shift_amt == 0);
++
++    put16(0, 0xFA1F); put16(2, 0xF283);      /* uxth.w r2, r3 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_UXTH && in.rd == 2 && in.rm == 3);
++
++    put16(0, 0xFA52); put16(2, 0xF183);      /* uxtab r1, r2, r3 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_UXTB && in.rn == 2 && in.rd == 1 && in.rm == 3);
++
++    put16(0, 0xEEF7); put16(2, 0x1A00);      /* vmov.f32 s3, #1.0 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VMOV_IMM && in.vd == 3 && in.imm == 0x70 && !in.vfp_dp);
++
++    put16(0, 0xEE10); put16(2, 0x0B90);      /* vmov.32 r0, d16[0] */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VMOV_SC_TO_C && in.rt == 0 && in.vd == 16 && in.imm == 0);
++
++    put16(0, 0xEC43); put16(2, 0x2B30);      /* vmov d16, r2, r3 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VMOV_RR_TO_V && in.rt == 2 && in.rt2 == 3 && in.vm == 16 && in.vfp_dp);
++
++    put16(0, 0xEEB7); put16(2, 0x0BC1);      /* vcvt.f32.f64 s0, d1 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VCVT_FF && !in.vfp_dp && in.vd == 0 && in.vm == 1);
++
++    put16(0, 0xEEB7); put16(2, 0x0AC1);      /* vcvt.f64.f32 d0, s2 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VCVT_FF && in.vfp_dp && in.vd == 0 && in.vm == 2);
++
++    put16(0, 0xEEB8); put16(2, 0x0BC0);      /* vcvt.f64.s32 d0, s0 */
++    in = dec(ARM_T32, BASE);
++    assert(in.op == OP_VCVT_I2F && in.vfp_dp && in.vd == 0 && in.vm == 0);
+ 
+     printf("  32-bit thumb operands          ok\n");
+ }
+@@ -425,6 +541,16 @@ static void test_wide_branch_group(void) {
+     in = dec(ARM_T32, BASE + 24);
+     assert(in.cls == A_BRANCH && in.conditional);
+ 
++    /* The same group with cond=0xD (LE), taken from MLB 15 at 0x813F7D56:
++     * `ble.w 0x813F7B02`, 0x258 bytes backwards. The condition-space test used
++     * to shift one bit too far, so 0xD looked like 111x and the instruction was
++     * trapped as `sys` ΓÇö the program stopped there. */
++    put16(32, 0xF77F); put16(34, 0xAED4);
++    in = dec(ARM_T32, BASE + 32);
++    assert(in.cls == A_BRANCH && in.op == OP_B);
++    assert(in.conditional && in.cond == 0xD);
++    assert(in.has_target && in.target == BASE + 36 - 0x258);
++
+     printf("  wide branch group, all four    ok\n");
+ }
+ 
+@@ -579,6 +705,14 @@ static void test_vfp(void) {
+     put16(0, 0xEE80); put16(2, 0x0A81);
+     assert(dec(ARM_T32, BASE).op == OP_VDIV);
+ 
++    /* vdup.32 d20, r0 shares opc1 with vdiv.f64 but has bit 4 set: SIMD, not a division */
++    put16(0, 0xEEC4); put16(2, 0x0B90);
++    in = dec(ARM_T32, BASE);
++    assert(in.op != OP_VDIV && in.cls == A_SIMD);
++    /* vdiv.f64 d0, d20, d0 itself still decodes */
++    put16(0, 0xEE84); put16(2, 0x0B80);
++    assert(dec(ARM_T32, BASE).op == OP_VDIV);
++
+     /* vcmp.f32 s0, s1 */
+     put16(0, 0xEEB4); put16(2, 0x0A41);
+     in = dec(ARM_T32, BASE);
+@@ -648,7 +782,33 @@ static void test_it_block(void) {
+     in = dec(ARM_T32, BASE);
+     assert(in.cls == A_NOP);
+ 
+-    printf("  it block vs nop                ok\n");
++    /* The conditions reach the following instructions through arm_it_apply.
++     * MLB 15 computes |a - b| as `rsbs r1, r3, #0; cmp r3, #0; it ge;
++     * movge r1, r3`: without the condition the mov always ran and a crowd
++     * loop got a count of -95, i.e. four billion iterations. */
++    arm_it its;
++    arm_it_reset(&its);
++    put16(0, 0xBFA8);                      /* it ge                          */
++    put16(2, 0x4619);                      /* mov r1, r3                     */
++    put16(4, 0x2001);                      /* movs r0, #1 (after the block)  */
++    in = dec(ARM_T32, BASE);     arm_it_apply(&its, &in);
++    arm_insn mv = dec(ARM_T32, BASE + 2); arm_it_apply(&its, &mv);
++    arm_insn after = dec(ARM_T32, BASE + 4); arm_it_apply(&its, &after);
++    assert(mv.cond == 0xA);                /* GE                             */
++    assert(after.cond == ARM_COND_AL && after.sets_flags);
++
++    /* ite eq: the second one is NE, and a 16-bit adds inside sets no flags */
++    arm_it_reset(&its);
++    put16(0, 0xBF0C);                      /* ite eq                         */
++    put16(2, 0x3001);                      /* addeq r0, #1                   */
++    put16(4, 0x3801);                      /* subne r0, #1                   */
++    in = dec(ARM_T32, BASE);     arm_it_apply(&its, &in);
++    arm_insn a1 = dec(ARM_T32, BASE + 2); arm_it_apply(&its, &a1);
++    arm_insn a2 = dec(ARM_T32, BASE + 4); arm_it_apply(&its, &a2);
++    assert(a1.cond == 0x0 && !a1.sets_flags);
++    assert(a2.cond == 0x1 && !a2.sets_flags);
++
++    printf("  it block vs nop, conditions    ok\n");
+ }
+ 
+ /* --- refusing to run off the end -------------------------------------------- */
+diff --git a/tests/test_runtime.c b/tests/test_runtime.c
+index 57df097..47bde61 100644
+--- a/tests/test_runtime.c
++++ b/tests/test_runtime.c
+@@ -356,6 +356,129 @@ static void test_memory(void) {
+     printf("  memory, unaligned and bounds   ok\n");
+ }
+ 
++/* --- NEON --------------------------------------------------------------------
++ *
++ * Encodings taken from a real title's disassembly, with the mnemonic the
++ * disassembler gave them; raw is (first halfword << 16) | second. */
++
++static float sf(int s) { return vfp_s[s].f; }
++static void  setf4(int q, float a, float b, float c, float d) {
++    vfp_s[q * 4].f = a; vfp_s[q * 4 + 1].f = b; vfp_s[q * 4 + 2].f = c; vfp_s[q * 4 + 3].f = d;
++}
++#define DW(d, k) vfp_s[(d) * 2 + (k)].u
++
++static void test_neon(void) {
++    memset(vfp_s, 0, sizeof(vfp_s));
++
++    setf4(11, 1, 2, 3, 4); setf4(1, 10, 20, 30, 40);
++    neon_dp(0, 0xEF064DC2u);                               /* vadd.f32 q2, q11, q1 */
++    assert(sf(8) == 11 && sf(9) == 22 && sf(10) == 33 && sf(11) == 44);
++
++    setf4(15, 1, 2, 3, 4); vfp_s[0].f = 2.5f;
++    neon_dp(0, 0xFFEE69C0u);                               /* vmul.f32 q11, q15, d0[0] */
++    assert(sf(44) == 2.5f && sf(47) == 10.0f);
++
++    setf4(10, 1, 1, 1, 1); vfp_s[2].f = 3.0f;
++    neon_dp(0, 0xFFE461C1u);                               /* vmla.f32 q11, q10, d1[0] */
++    assert(sf(44) == 5.5f && sf(47) == 13.0f);
++
++    setf4(8, 9, 9, 9, 9);
++    neon_dp(0, 0xEFC00050u);                               /* vmov.i32 q8, #0 */
++    assert(DW(16, 0) == 0 && DW(17, 1) == 0);
++
++    neon_dup_core(0xEEA81B90u, 7);                         /* vdup.32 q12, r1 */
++    assert(DW(24, 0) == 7 && DW(25, 1) == 7);
++    neon_dp(0, 0xFFBB2668u);                               /* vcvt.f32.s32 q1, q12 */
++    assert(sf(4) == 7.0f && sf(7) == 7.0f);
++
++    neon_dp(0, 0xEF2821F8u);                               /* vorr q1, q12, q12 (vmov) */
++    assert(DW(2, 0) == 7 && DW(3, 1) == 7);
++
++    vfp_s[32].f = 1; vfp_s[33].f = 2;
++    neon_dp(0, 0xFF400DA0u);                               /* vpadd.f32 d16, d16, d16 */
++    assert(sf(32) == 3 && sf(33) == 3);
++
++    DW(19, 0) = 0x12345678u; DW(19, 1) = 0xFFFF0000u;
++    neon_dp(0, 0xFFF03033u);                               /* vshr.u32 d19, d19, #16 */
++    assert(DW(19, 0) == 0x1234u && DW(19, 1) == 0xFFFFu);
++
++    DW(17, 0) = 0x5; DW(17, 1) = 0x0;
++    neon_dp(0, 0xEFB0C531u);                               /* vshl.i32 d12, d17, #16 */
++    assert(DW(12, 0) == 0x50000u);
++
++    DW(16, 0) = 0xFFFF0000u; DW(16, 1) = 0;
++    DW(17, 0) = 0xAAAAAAAAu; DW(17, 1) = 0x11111111u;
++    DW(19, 0) = 0x55555555u; DW(19, 1) = 0x22222222u;
++    neon_dp(0, 0xFF5101B3u);                               /* vbsl d16, d17, d19 */
++    assert(DW(16, 0) == 0xAAAA5555u && DW(16, 1) == 0x22222222u);
++
++    vfp_s[34].f = 5; vfp_s[35].f = -1; vfp_s[32].f = 1; vfp_s[33].f = 1;
++    neon_dp(0, 0xFF611EA0u);                               /* vcgt.f32 d17, d17, d16 */
++    assert(DW(17, 0) == 0xFFFFFFFFu && DW(17, 1) == 0);
++
++    DW(14, 0) = 1; DW(14, 1) = 2;
++    neon_dp(0, 0xEFBEE40Eu);                               /* vext.32 d14, d14, d14, #1 */
++    assert(DW(14, 0) == 2 && DW(14, 1) == 1);
++
++    DW(20, 0) = 1; DW(20, 1) = 2; DW(21, 0) = 3; DW(21, 1) = 4;
++    neon_dp(0, 0xFFFA40A5u);                               /* vtrn.32 d20, d21 */
++    assert(DW(20, 0) == 1 && DW(20, 1) == 3 && DW(21, 0) == 2 && DW(21, 1) == 4);
++
++    DW(26, 0) = 1; DW(26, 1) = 2;
++    neon_dp(0, 0xFFF8F02Au);                               /* vrev64.32 d31, d26 */
++    assert(DW(31, 0) == 2 && DW(31, 1) == 1);
++
++    DW(16, 0) = 42; DW(16, 1) = 43;
++    neon_dp(0, 0xFFF44C60u);                               /* vdup.32 q10, d16[0] */
++    assert(DW(20, 0) == 42 && DW(21, 1) == 42);
++
++    vfp_s[40].f = 10; vfp_s[41].f = 10; vfp_s[36].f = 2; vfp_s[37].f = 3;
++    vfp_s[32].f = 4; vfp_s[33].f = 1;
++    neon_dp(0, 0xEF624DB0u);                               /* vmls.f32 d20, d18, d16 */
++    assert(sf(40) == 2 && sf(41) == 7);
++
++    DW(25, 0) = 10; DW(25, 1) = 0; DW(16, 0) = 3; DW(16, 1) = 1;
++    neon_dp(0, 0xFF6988A0u);                               /* vsub.i32 d24, d25, d16 */
++    assert(DW(24, 0) == 7 && DW(24, 1) == 0xFFFFFFFFu);
++
++    setf4(1, 1, -2, 0, 4);
++    neon_dp(0, 0xFFB9A7C2u);                               /* vneg.f32 q5, q1 */
++    assert(sf(20) == -1 && sf(21) == 2 && sf(23) == -4);
++
++    setf4(8, 1, 5, -3, 0); setf4(11, 2, 4, -4, 0);
++    neon_dp(0, 0xEF400FE6u);                               /* vmax.f32 q8, q8, q11 */
++    assert(sf(32) == 2 && sf(33) == 5 && sf(34) == -3);
++
++    vfp_s[44].f = 4.0f; vfp_s[45].f = 0.5f;
++    neon_dp(0, 0xFFFB7526u);                               /* vrecpe.f32 d23, d22 */
++    assert(sf(46) == 0.25f && sf(47) == 2.0f);
++
++    setf4(6, 0, 0, 0, 0); DW(12, 0) = 0xF0F0F0F0u; DW(12, 1) = 0xFFFFFFFFu;
++    DW(2, 0) = 0x0FF00FF0u; DW(2, 1) = 0x12345678u;
++    neon_dp(0, 0xEF0C2152u);                               /* vand q1, q6, q1 */
++    assert(DW(2, 0) == 0x00F000F0u && DW(2, 1) == 0x12345678u);
++
++    /* loads and stores */
++    assert(vita_mem_init(0x81000000u, 64 * 1024) == 0);
++    for (int i = 0; i < 32; i++) vita_write8(0x81000100u + (uint32_t)i, (uint8_t)i);
++    assert(neon_ldst(0, 0xF9E01C8Fu, 0x81000100u) == 4);  /* vld1.32 {d17[]}, [r0] */
++    assert(DW(17, 0) == 0x03020100u && DW(17, 1) == 0x03020100u);
++    assert(neon_ldst(0, 0xF9210A0Du, 0x81000104u) == 16); /* vld1.8 {d0, d1}, [r1]! */
++    assert(DW(0, 0) == 0x07060504u && DW(1, 1) == 0x13121110u);
++    DW(0, 0) = 0xCAFEBABEu;
++    assert(neon_ldst(0, 0xF988080Fu, 0x81000200u) == 4);  /* vst1.32 {d0[0]}, [r8] */
++    assert(vita_read32(0x81000200u) == 0xCAFEBABEu);
++    DW(20, 0) = 1; DW(20, 1) = 2; DW(21, 0) = 3; DW(21, 1) = 4;
++    assert(neon_ldst(0, 0xF9444ACFu, 0x81000300u) == 16); /* vst1.64 {d20, d21}, [r4] */
++    assert(vita_read32(0x81000300u) == 1 && vita_read32(0x8100030Cu) == 4);
++
++    neon_set_lane(0xEE200B10u, 0xAB);                      /* vmov.32 d0[1], r0 */
++    assert(DW(0, 1) == 0xAB);
++    assert(neon_get_lane(0xEE300B10u) == 0xAB);            /* vmov.32 r0, d0[1] */
++    vita_mem_free();
++    printf("  neon: arithmetic, permutes, ld/st ok\n");
++}
++
+ int main(void) {
+     printf("runtime:\n");
+     test_shifts();
+@@ -368,6 +491,7 @@ int main(void) {
+     test_dispatch();
+     test_hle_libc();
+     test_memory();
++    test_neon();
+     printf("all runtime tests passed\n");
+     return 0;
+ }
+diff --git a/tools/armrecomp/analyze.c b/tools/armrecomp/analyze.c
+index b14a48b..073d484 100644
+--- a/tools/armrecomp/analyze.c
++++ b/tools/armrecomp/analyze.c
+@@ -8,6 +8,7 @@
+ 
+ #include "analyze.h"
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -39,6 +40,9 @@ static void sq_push(seedq *q, uint32_t addr, arm_mode mode, uint8_t heur) {
+     q->v[q->n].mode = mode;
+     q->v[q->n].heur = heur;
+     q->n++;
++    extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA: direcci├│n a rastrear (0 = nada) */
++    if (g_dbg_trace_addr && addr == g_dbg_trace_addr)
++        fprintf(stderr, "[sq] push %08X heur=%u n=%u\n", addr, heur, q->n);
+ }
+ 
+ static void add_func(vf_result *r, uint32_t addr, arm_mode mode, uint8_t heur) {
+@@ -95,15 +99,30 @@ static void walk(const vm_image *img, const vm_module *mod, vf_result *r,
+     while (local.n) {
+         seed s = local.v[--local.n];
+         uint32_t a = s.addr;
++        extern uint32_t g_dbg_trace_addr;
++        if (g_dbg_trace_addr && a == g_dbg_trace_addr)
++            fprintf(stderr, "[walk] semilla %08X procesada (fn=%08X)\n", a, fn ? fn->addr : 0);
++        int cmp_reg = -1;       /* last `cmp rX, #imm`: bounds a table branch */
++        uint32_t cmp_imm = 0;
++        int prev_reg = -1, lo_check = 0;
++        uint32_t prev_imm = 0;
++        arm_it its;
++        arm_it_reset(&its);                       /* a block never starts inside IT */
+ 
+         for (;;) {
+             if (a < base || a >= base + len) break;
+             uint32_t off = a - base;
+-            if (seen_get(r, off)) break;          /* already decoded here */
++            if (seen_get(r, off)) {
++                extern uint32_t g_dbg_trace_addr;
++                if (g_dbg_trace_addr && (a == g_dbg_trace_addr || a + 4 == g_dbg_trace_addr || a + 2 == g_dbg_trace_addr))
++                    fprintf(stderr, "[walk] %08X ya visto: paro el bloque (fn=%08X)\n", a, fn ? fn->addr : 0);
++                break;          /* already decoded here */
++            }
+ 
+             arm_insn in;
+             int n = arm_decode(text, base, len, a, s.mode, &in);
+             if (n == 0) break;
++            arm_it_apply(&its, &in);
+ 
+             seen_set(r, off);
+             r->insns_total++;
+@@ -156,9 +175,36 @@ static void walk(const vm_image *img, const vm_module *mod, vf_result *r,
+                 continue;
+             }
+ 
+-            if (in.cls == A_RETURN) break;
++            if (in.cls == A_RETURN && !in.conditional) break;   /* `bxeq lr` in IT falls through */
++
++            /* `cmp r0, #0x50; bgt out; cmp r0, #0x1f; ble out; subs r0, #0x20; tbh`: the
++             * second cmp is a LOWER bound. Taking it as the count read 32 of 49 entries.
++             * A cmp whose very next instruction branches on le/lt/ls/lo keeps the upper
++             * bound already known for that register. */
++            if (lo_check) {
++                lo_check = 0;
++                if (in.cls == A_BRANCH && in.has_target && prev_reg == cmp_reg &&
++                    (in.cond == 0xD || in.cond == 0xB || in.cond == 0x9 || in.cond == 0x3)) cmp_imm = prev_imm;
++            }
++            if (in.op == OP_CMP && in.has_imm) {
++                prev_reg = cmp_reg; prev_imm = cmp_imm;
++                cmp_reg = in.rn; cmp_imm = in.imm; lo_check = 1;
++            }
++            /* `cmp r2, #44; ...; subs r2, #10; tbb [pc, r2]`: the index is 0..34. Reading 45
++             * entries ran into the padding after the table and the table was dropped. */
++            else if (in.op == OP_SUB && in.has_imm && cmp_reg >= 0 && in.rn == cmp_reg && in.imm <= cmp_imm) {
++                cmp_imm -= in.imm;
++                cmp_reg = in.rd;
++            }
++            if (in.op == OP_TBB || in.op == OP_TBH) {
++                uint32_t tt[1024];
++                uint32_t cnt = (cmp_reg == in.rm) ? cmp_imm + 1 : 0;
++                int nt = arm_table_targets(text, base, len, &in, cnt, tt, 1024);
++                for (int k = 0; k < nt; k++) sq_push(&local, tt[k], s.mode, 0);
++                if (nt) break;
++            }
+ 
+-            if (in.cls == A_INDIRECT) { r->indirect_sites++; break; }
++            if (in.cls == A_INDIRECT) { r->indirect_sites++; if (!in.conditional) break; }
+ 
+             if (in.cls == A_BRANCH && in.has_target) {
+                 sq_push(&local, in.target, s.mode, 0);
+@@ -200,12 +246,31 @@ static int code_ptr_shape(const vm_image *img, const uint8_t *p, uint32_t *out)
+ 
+ /* How many consecutive words from `off` have that shape.
+  *
+- * This is the evidence that turns a guess into a reading. Four adjacent words
+- * that are all Thumb-tagged, all correctly aligned, and all land inside a
+- * 5.6 MB window of a 4 GB space do not happen by accident ΓÇö the odds are
+- * around 1 in 10^13. Such a run is a POINTER TABLE, and knowing that is worth
+- * more than any property of the individual entries. */
+-#define SHAPE_RUN_MIN 4
++ * This is the evidence that turns a guess into a reading. Adjacent words that
++ * are all Thumb-tagged, all correctly aligned, and all land inside a 5.6 MB
++ * window of a 4 GB space do not happen by accident. Such a run is a POINTER
++ * TABLE, and knowing that is worth more than any property of the individual
++ * entries.
++ *
++ * THREE, not four: an ARM EABI vtable for a multiple-inheritance class starts
++ * with two non-code words (offset-to-top and the typeinfo pointer), and a
++ * short class can have exactly three virtual entries after that header. That
++ * is the shape MLB 15 uses for its olSocial* classes, and at four entries the
++ * adjustor thunks in them were rejected: they begin with `sub.w r0, r0, #n`
++ * rather than a push, so they need the table to vouch for them. Missing one
++ * is not a cosmetic gap ΓÇö the first virtual call on the object stops the
++ * program (0x81C4AFE9 here). At three words the odds are still about 1 in
++ * 10^10 per position; a handful of false positives across a 15 MB image is
++ * possible, and each costs one dispatch slot, not correctness. */
++#define SHAPE_RUN_MIN 3
++
++/* A gap this large between reliable function starts is not code (see vf_discover). */
++#define CODE_GAP (256u * 1024u)
++
++static int u32_cmp(const void *a, const void *b) {
++    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
++    return x < y ? -1 : x > y;
++}
+ 
+ static uint32_t shape_run_len(const vm_image *img, const uint8_t *scan,
+                               uint32_t scan_len, uint32_t off) {
+@@ -217,6 +282,34 @@ static uint32_t shape_run_len(const vm_image *img, const uint8_t *scan,
+     return n;
+ }
+ 
++/* Does `t` start right after the end of a function: padding, a return or an
++ * unconditional branch just before it, and something decodable at it? A
++ * function begins where the previous one stops; a pointer into rodata almost
++ * never lands on such a spot. */
++static int after_function_end(const uint8_t *text, uint32_t base, uint32_t len, uint32_t t) {
++    if (t < base + 4 || t + 2 > base + len) return 0;
++    int end = 0;
++    /* k = 0: right after the previous function. k > 0: after a literal pool
++     * of k words that follows it (pools are word-aligned; 0x8158D524 sits
++     * after one word of 0x66666666 that follows a `nop` of padding). */
++    for (uint32_t k = 0; k <= 16 && !end; k++) {
++        uint32_t p = t - 4 * k;
++        if (k && (p & 3)) p &= ~3u;
++        if (p < base + 4) break;
++        arm_insn pv;
++        uint32_t at = p - base;
++        uint16_t p16 = (uint16_t)(text[at - 2] | ((uint16_t)text[at - 1] << 8));
++        end = p16 == 0xBF00 || (k == 0 && p16 == 0x0000);             /* padding */
++        if (!end && arm_decode(text, base, len, p - 2, ARM_T32, &pv) == 2)
++            end = pv.cls == A_RETURN || (pv.cls == A_BRANCH && !pv.conditional);
++        if (!end && arm_decode(text, base, len, p - 4, ARM_T32, &pv) == 4)
++            end = pv.cls == A_RETURN || (pv.cls == A_BRANCH && !pv.conditional);
++    }
++    arm_insn first;
++    return end && arm_decode(text, base, len, t, ARM_T32, &first) &&
++           first.cls != A_UNKNOWN && first.cls != A_UNDEF;
++}
++
+ /* Sweep one region for words that look like pointers INTO the executable
+  * segment. The region being scanned and the region being pointed at are two
+  * different things: candidates come from wherever the module stores pointers,
+@@ -245,8 +338,17 @@ static uint32_t shape_scan_region(const vm_image *img, vf_result *r, seedq *q,
+ 
+         if (!code_ptr_shape(img, scan + off, &t)) continue;
+ 
+-        /* Do not re-seed something already decoded: that is not a discovery. */
+-        if (seen_get(r, t - base)) continue;
++        /* Already decoded as part of another function's walk: still an ENTRY.
++         * A Thumb-tagged pointer that lands exactly on a decoded instruction
++         * start is the strongest evidence this heuristic ever gets, and
++         * skipping it left 206 of one title's 1,461 static constructors out of
++         * the dispatch table ΓÇö each a trap when the startup code calls it. */
++        if (seen_get(r, t - base)) {
++            sq_push(q, t, ARM_T32, 1);
++            r->seeds_shape++;
++            found++;
++            continue;
++        }
+ 
+         arm_insn in;
+         if (arm_decode(text, base, len, t, ARM_T32, &in) == 0) { r->rejected_shape++; continue; }
+@@ -271,13 +373,22 @@ static uint32_t shape_scan_region(const vm_image *img, vf_result *r, seedq *q,
+          * is 47 of the 551 static constructors, and they are exactly the kind
+          * you would expect: leaves that start with `movw` because they store a
+          * constant and save nothing, and one that is a bare `bx lr`. Each one
+-         * missed is a run-time trap in a table the program walks at startup. */
++         * missed is a run-time trap in a table the program walks at startup.
++         *
++         * Aceptamos tambi├⌐n `bx lr` (0x4770) como pr├│logo v├ílido para cubrir
++         * los stubs nulos de tablas virtuales (vtable thunks) que el juego
++         * usa mucho y no empujan registros.
++         */
+         uint16_t h = (uint16_t)(text[t - base] | ((uint16_t)text[t - base + 1] << 8));
+         int prologue = ((h & 0xFE00) == 0xB400)          /* push            */
+                     || (h == 0xE92D)                     /* push.w / stmdb  */
+-                    || ((h & 0xFF80) == 0xB080);         /* sub sp, #imm    */
++                    || ((h & 0xFF80) == 0xB080)          /* sub sp, #imm    */
++                    || (h == 0x4770);                    /* bx lr           */
+ 
+-        if (!prologue && !in_table) { r->rejected_shape++; continue; }
++        /* A lone pointer to a leaf with no prologue (`movs r0, #0; bx lr` in a
++         * table of {name, handler} records: 0x8158D525) is accepted when it
++         * lands right after the end of the previous function. */
++        if (!prologue && !in_table && !after_function_end(text, base, len, t)) { r->rejected_shape++; continue; }
+ 
+         sq_push(q, t, ARM_T32, 1);
+         r->seeds_shape++;
+@@ -286,6 +397,162 @@ static uint32_t shape_scan_region(const vm_image *img, vf_result *r, seedq *q,
+     return found;
+ }
+ 
++/* --- movw/movt address construction ---------------------------------------- */
++/*
++ * A function whose address is only ever COMPUTED leaves no pointer word
++ * anywhere for the shape sweep to find. Three of them stopped MLB 15 during
++ * start-up:
++ *
++ *   0x810323A4  the GXM display-queue callback. The game writes it into a
++ *               SceGxmInitializeParams that it builds on the STACK, so the
++ *               pointer never exists in .text or in a data segment.
++ *   0x810313DC  the "Display Engine" thread entry, passed as an argument to
++ *               sceKernelCreateThread.
++ *   0x8100AF4A  a front-end helper reached through a C++ member pointer. It
++ *               begins with movw/movt itself (loads a global), so it has no
++ *               prologue to recognise either.
++ *
++ * They are materialised as a movw/movt pair, which is how a compiler builds a
++ * 32-bit address without a relocation. This pass collects every such pair and
++ * seeds a target when there is evidence that it is code:
++ *
++ *   - it starts with a prologue (push / sub sp), or
++ *   - two or more INDEPENDENT sites materialise the same address.
++ *
++ * The second rule is what finds 0x8100AF4A: twenty-odd call sites form its
++ * address, but it starts with `movw r1, #...`, which no prologue test accepts.
++ * A single reference without a prologue is still rejected ΓÇö movw/movt is also
++ * how a compiler forms the address of a constant, and .text holds its own
++ * literal pools and strings ΓÇö and a multi-reference candidate must decode as
++ * at least a few Thumb instructions before it is believed.
++ *
++ * Targets are accepted with or without the Thumb bit: a function symbol is
++ * commonly stored even and or-ed with 1 at the call site.
++ */
++static uint32_t scan_movw_movt(const vm_image *img, vf_result *r, seedq *q) {
++    const uint8_t *text = img->data + img->seg_file;
++    const uint32_t base = img->seg_vaddr;
++    const uint32_t len  = img->seg_len;
++
++    #define MOVW_CAND 65536
++    struct cand { uint32_t addr, count; uint8_t prologue, thumb; };
++    static struct cand cand[MOVW_CAND];
++    memset(cand, 0, sizeof(cand));
++
++    uint32_t lo[16] = {0};
++    uint32_t lo_at[16] = {0};
++    uint8_t  have[16] = {0};
++    uint32_t found = 0;
++
++    for (uint32_t off = 0; off + 4 <= len; ) {
++        arm_insn in;
++        /* Se avanza de media palabra en media palabra, PERO si la instruccion
++         * decodificada tiene ancho 4, la siguiente media palabra es la segunda
++         * mitad de esa misma instruccion y NO debe decodificarse como inicio.
++         * Saltarla evita que un movw/movt parcial se registre como escritura
++         * al mismo registro y borre el par pendiente. */
++        int ok_dec = arm_decode(text, base, len, base + off, ARM_T32, &in);
++        if (!ok_dec) { off += 2; continue; }
++
++        uint32_t next_off = off + (in.width == 4 ? 4 : 2);
++
++        if (in.cls == A_ALU && in.has_imm && in.rd >= 0 && in.rd < 16) {
++            int is_movw = (in.width == 4 && in.op == OP_MOV &&
++                           in.mnemonic && strcmp(in.mnemonic, "movw") == 0);
++            if (is_movw) {
++                lo[in.rd] = in.imm & 0xFFFFu;
++                lo_at[in.rd] = base + off;
++                have[in.rd] = 1;
++            } else if (in.width == 4 && in.op == OP_MOVT) {
++                /* Two instructions apart at most in practice, but a compiler
++                 * will happily interleave stores to the stack between them:
++                 * MLB 15 builds 0x8164B97F with the movw and movt 22 bytes
++                 * apart (strd/strd/ldr in between). 64 bytes covers that and
++                 * stays safe because ANY other write to the same register
++                 * clears the pending low half below. */
++                if (have[in.rd] && (base + off) - lo_at[in.rd] <= 64) {
++                    uint32_t v = (in.imm << 16) | lo[in.rd];
++                    uint32_t t = v & ~1u;
++                    if (t >= base && t + 2 <= base + len && ((t - base) & 1u) == 0) {
++                        uint32_t toff = t - base;
++                        uint16_t h = (uint16_t)(text[toff] | ((uint16_t)text[toff + 1] << 8));
++                        int prologue = ((h & 0xFE00) == 0xB400)   /* push          */
++                                    || (h == 0xE92D)              /* push.w/stmdb  */
++                                    || ((h & 0xFF80) == 0xB080);  /* sub sp, #imm  */
++                        /* Insertar en la tabla de candidatos. */
++                        uint32_t slot = (t * 2654435761u >> 16) & (MOVW_CAND - 1);
++                        for (int probe = 0; probe < 16; probe++) {
++                            uint32_t i = (slot + (uint32_t)probe) & (MOVW_CAND - 1);
++                            if (cand[i].addr == 0 || cand[i].addr == t) {
++                                cand[i].addr = t;
++                                cand[i].count++;
++                                cand[i].prologue |= (uint8_t)prologue;
++                                cand[i].thumb |= (uint8_t)(v & 1u);
++                                break;
++                            }
++                        }
++                    }
++                }
++                /* No se borra `have[rd]`: con el avance de media palabra, la
++                 * segunda mitad de un movw puede decodificarse como una
++                 * escritura al mismo registro y borraria un par valido. La
++                 * distancia maxima y el que la direccion combinada caiga
++                 * dentro de .text ya filtran los pares falsos. */
++            }
++        }
++        off = next_off;
++    }
++
++    for (int i = 0; i < MOVW_CAND; i++) {
++        uint32_t t = cand[i].addr;
++        if (!t) continue;
++        int ok = cand[i].prologue != 0;
++        if (!ok && cand[i].count >= 2) {
++            uint32_t off = t - base;
++            ok = 1;
++            for (int k = 0; k < 3; k++) {
++                arm_insn in;
++                if (off + 2 > len || arm_decode(text, base, len, base + off, ARM_T32, &in) == 0) {
++                    ok = 0;
++                    break;
++                }
++                if (in.cls == A_RETURN) break;
++                off += in.width ? in.width : 2;
++            }
++        }
++        /* One reference is enough for a callback (a qsort comparator, a
++         * handler registered once) when the value carries the Thumb bit AND
++         * the instruction right before the target ends a function: a function
++         * begins where the previous one stops. A pointer into rodata almost
++         * never satisfies both. MLB 15's first one was 0x813D7029, a leaf
++         * comparator with no prologue, reached only through qsort. */
++        if (!ok && cand[i].thumb && t >= base + 4) {
++            if (after_function_end(text, base, len, t)) ok = 1;
++            /* A literal pool between functions hides the previous one's
++             * return (0x8101D339 sits after one). Then: decoding forward must
++             * reach a return within 64 instructions through nothing
++             * undecodable ΓÇö text almost never reads as that. */
++            if (!ok) {
++                uint32_t o2 = t - base;
++                for (int k = 0; k < 64 && o2 + 2 <= len; k++) {
++                    arm_insn w;
++                    int n = arm_decode(text, base, len, base + o2, ARM_T32, &w);
++                    if (!n || w.cls == A_UNKNOWN || w.cls == A_UNDEF) break;
++                    if (w.cls == A_RETURN) { ok = 1; break; }
++                    if (w.cls == A_BRANCH && !w.conditional) break;
++                    o2 += (uint32_t)n;
++                }
++            }
++        }
++        if (ok) {
++            sq_push(q, t, ARM_T32, 1);
++            r->seeds_movw++;
++            found++;
++        }
++    }
++    return found;
++}
++
+ static void shape_scan(const vm_image *img, vf_result *r, seedq *q) {
+     shape_scan_region(img, r, q, img->data + img->seg_file, img->seg_len);
+ 
+@@ -307,6 +574,77 @@ static void shape_scan(const vm_image *img, vf_result *r, seedq *q) {
+     }
+ }
+ 
++/* Barrido de pr├│logos: funciones que nadie llama directamente y cuya direcci├│n
++ * solo se construye en registros (p. ej. `movw r2, #0x9be5` ... `movt r1,
++ * #0x81af`, en registros distintos, que scan_movw_movt no empareja). En el
++ * c├│digo que ning├║n recorrido ha decodificado, un `push {..., lr}` justo tras
++ * el final de otra funci├│n es el principio de una funci├│n: 0x81AF9BE4 de MLB 15,
++ * a la que el juego salta al empezar el partido. Solo hasta `code_end`. */
++static uint32_t prologue_scan(const vm_image *img, vf_result *r, seedq *q, uint32_t code_end) {
++    const uint8_t *text = img->data + img->seg_file;
++    const uint32_t base = img->seg_vaddr;
++    const uint32_t len  = img->seg_len;
++    uint32_t found = 0;
++    for (uint32_t off = 4; off + 4 <= len && base + off < code_end; off += 2) {
++        if (seen_get(r, off)) continue;
++        uint16_t h = (uint16_t)(text[off] | ((uint16_t)text[off + 1] << 8));
++        uint16_t h2 = (uint16_t)(text[off + 2] | ((uint16_t)text[off + 3] << 8));
++        int push_lr = (h & 0xFF00) == 0xB500                       /* push {..., lr}   */
++                   || (h == 0xE92D && (h2 & 0x4000) && !(h2 & 0xA000)); /* push.w con lr, sin pc/sp */
++        if (!push_lr) continue;
++        if (!after_function_end(text, base, len, base + off)) continue;
++        sq_push(q, base + off, ARM_T32, 1);
++        r->seeds_shape++;
++        found++;
++    }
++    return found;
++}
++
++/* Barrido de stubs: busca runs de 'bx lr' (0x4770) consecutivos en .text.
++ * Las vtables de MLB 15 contienen secuencias de stubs nulos (bx lr) separados
++ * 2 bytes, y el primer stub de la secuencia no tiene puntero est├ítico que lo
++ * apunte porque la vtable se parchea en tiempo de ejecuci├│n. */
++static uint32_t stub_scan(const vm_image *img, vf_result *r, seedq *q) {
++    const uint8_t *text = img->data + img->seg_file;
++    const uint32_t base = img->seg_vaddr;
++    const uint32_t len  = img->seg_len;
++    uint32_t found = 0;
++
++
++    for (uint32_t off = 0; off + 2 <= len; off += 2) {
++        uint16_t h = (uint16_t)(text[off] | ((uint16_t)text[off + 1] << 8));
++        if (h != 0x4770) continue;  /* bx lr */
++
++        /* Medir cu├íntos bx lr consecutivos hay a partir de aqu├¡. */
++        uint32_t run = 1;
++        /* `run` cuenta instrucciones, y cada una ocupa 2 bytes. Medirlo en
++         * bytes le├¡a 0x7047 (la mitad de un bx lr y la de otro): el run
++         * siempre val├¡a 1 y este barrido no sembraba nada. */
++        while (off + run * 2 + 2 <= len) {
++            uint16_t h2 = (uint16_t)(text[off + run * 2] | ((uint16_t)text[off + run * 2 + 1] << 8));
++            if (h2 != 0x4770) break;
++            run++;
++        }
++
++
++        if (run >= 3) {  /* run de 3+ bx lr = tabla de stubs nulos */
++            for (uint32_t i = 0; i < run; i++) {
++                uint32_t t = base + off + i * 2;
++                /* Aunque otro recorrido ya lo haya decodificado: decodificado no
++                 * es registrado como funci├│n, y un thunk de vtable se llama por
++                 * puntero. FN_TEST evita duplicados al sacar la semilla. */
++                {
++                    sq_push(q, t, ARM_T32, 1);
++                    r->seeds_shape++;  /* contamos como shape para estad├¡sticas */
++                    found++;
++                }
++            }
++            off += (run - 1) * 2;  /* saltar el resto del run */
++        }
++    }
++    return found;
++}
++
+ /* --- entry point ------------------------------------------------------------ */
+ 
+ int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+@@ -357,6 +695,26 @@ int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+         const uint8_t *text = img->data + img->seg_file;
+         for (uint32_t off = 0; off + 4 <= img->seg_len; off += 2) {
+             arm_insn in;
++            /* Only at an instruction boundary. Read from its second halfword,
++             * a 32-bit instruction followed by another can decode as a BL to
++             * anywhere: `bl` at 0x81BECADC read from 0x81BECADE "called"
++             * 0x8186CC98, the middle of zlib's longest_match loop. As a sure
++             * start it split the loop into functions that call each other once
++             * per iteration, and the native stack overflowed.
++             *
++             * The rule is exact in code: count the 32-bit prefix halfwords
++             * (0b11101/0b11110/0b11111) right before `off`. The halfword before
++             * that run is not a prefix, so it ends an instruction (a 16-bit one
++             * or a second half); inside the run prefixes pair up as first and
++             * second halves, so `off` starts an instruction iff the count is even. */
++            uint32_t m = 0;
++            while (m * 2 + 2 <= off) {
++                uint32_t p = off - m * 2 - 2;
++                uint16_t h = (uint16_t)(text[p] | ((uint16_t)text[p + 1] << 8));
++                if ((h >> 11) < 0x1D) break;
++                m++;
++            }
++            if (m & 1) continue;
+             if (arm_decode(text, base, img->seg_len, base + off, ARM_T32, &in) == 0) continue;
+             if (in.cls == A_CALL && in.has_target &&
+                 in.target >= base && in.target < base + img->seg_len) {
+@@ -372,6 +730,37 @@ int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+         }
+     }
+ 
++    /* 3b. Addresses built with movw/movt. Deliberately here, before the main
++     *     walk: seeds pushed after `head` has passed them are never visited. */
++    scan_movw_movt(img, out, &q);
++
++    /* Where the code ends. The tail of the executable segment is read-only
++     * data, and tables of pointers to strings there have the shape of Thumb
++     * pointer tables whenever the strings sit at odd addresses. Walked as code
++     * they produced 8,800 "functions" in MLB 15's rodata and 19 M bogus
++     * instructions (the image no longer linked). Reliable starts ΓÇö call
++     * targets and exports ΓÇö are dense through real code, so the code ends
++     * before the first large gap between them. Thumb seeds past it are
++     * dropped, reliable ones too: a walk that runs off the end of a function
++     * into data decodes junk BLs there, and each "call target" in data walked
++     * more data (0x81E2F782 is referenced by nothing). The import stubs at the
++     * very end are ARM code and are not affected. */
++    uint32_t code_end = base + img->seg_len;
++    {
++        uint32_t ns = 0;
++        uint32_t *sv = (uint32_t *)malloc((q.n + 1) * sizeof(uint32_t));
++        if (sv) {
++            for (uint32_t i = 0; i < q.n; i++)
++                if (!q.v[i].heur && q.v[i].addr >= base && q.v[i].addr < base + img->seg_len)
++                    sv[ns++] = q.v[i].addr;
++            sv[ns++] = base + img->seg_len;   /* the segment end closes the last gap */
++            qsort(sv, ns, sizeof(uint32_t), u32_cmp);
++            for (uint32_t i = 1; i < ns; i++)
++                if (sv[i] - sv[i - 1] > CODE_GAP) { code_end = sv[i - 1] + CODE_GAP; break; }
++            free(sv);
++        }
++    }
++
+     /* A separate registry of function ENTRIES, distinct from the map of decoded
+      * instructions.
+      *
+@@ -395,6 +784,7 @@ int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+     while (head < q.n) {
+         seed s = q.v[head++];
+         if (s.addr < base || s.addr >= base + img->seg_len) continue;
++        if (s.addr >= code_end && s.mode == ARM_T32) { out->rejected_shape++; continue; }
+         if (FN_TEST(s.addr)) continue;
+ 
+         FN_MARK(s.addr);
+@@ -406,10 +796,19 @@ int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+      *    only ever adds what the reliable seeds could not reach. */
+     uint32_t before = q.n;
+     shape_scan(img, out, &q);
++
++    /* 4b. Stub scan: runs de bx lr en .text que la shape scan no ve por falta
++     * de punteros est├íticos (vtables parcheadas en runtime). */
++    stub_scan(img, out, &q);
++
++    /* 4c. Pr├│logos que nadie alcanz├│ (direcciones construidas en registros). */
++    prologue_scan(img, out, &q, code_end);
++
+     head = before;
+     while (head < q.n) {
+         seed s = q.v[head++];
+         if (s.addr < base || s.addr >= base + img->seg_len) continue;
++        if (s.addr >= code_end && s.mode == ARM_T32) { out->rejected_shape++; continue; }
+         if (FN_TEST(s.addr)) continue;
+ 
+         FN_MARK(s.addr);
+diff --git a/tools/armrecomp/analyze.h b/tools/armrecomp/analyze.h
+index fc81146..ec85c85 100644
+--- a/tools/armrecomp/analyze.h
++++ b/tools/armrecomp/analyze.h
+@@ -52,6 +52,10 @@ typedef struct {
+      * than among instructions, which is a far better place to look ΓÇö merging
+      * the counts would hide which sweep is doing the work. */
+     uint32_t seeds_shape_data;
++    /* Addresses materialised as a movw/movt pair. A function reached only this
++     * way (a stack-built callback struct, a thread entry passed as an argument)
++     * has no pointer word for the shape sweep to find. */
++    uint32_t seeds_movw;
+     uint32_t rejected_shape;
+     /* Mode-switching calls whose target is not a known import stub, and so
+      * were not followed into ARM. Counted rather than hidden: if a module has
+diff --git a/tools/armrecomp/decode.c b/tools/armrecomp/decode.c
+index fa3a6cd..dda43e2 100644
+--- a/tools/armrecomp/decode.c
++++ b/tools/armrecomp/decode.c
+@@ -33,6 +33,37 @@ const char *arm_class_name(arm_class c) {
+     }
+ }
+ 
++void arm_it_reset(arm_it *s) { s->n = s->pos = 0; s->next = 0; }
++
++void arm_it_apply(arm_it *s, arm_insn *in) {
++    if (s->pos < s->n && in->addr != s->next) arm_it_reset(s);   /* left the block */
++    if (s->pos < s->n) {
++        in->cond = s->cond[s->pos++];
++        s->next = in->addr + in->width;
++        if (in->cls == A_BRANCH || in->cls == A_RETURN || in->cls == A_CALL || in->cls == A_INDIRECT)
++            in->conditional = 1;
++        /* 16-bit data processing does not set flags inside IT: `adds` there
++         * is `add`. The comparisons always set them. */
++        if (in->width == 2 && in->sets_flags &&
++            in->op != OP_CMP && in->op != OP_CMN && in->op != OP_TST)
++            in->sets_flags = 0;
++        return;
++    }
++    if (in->op == OP_IT) {
++        /* ITSTATE = firstcond:mask. Instruction k uses firstcond[3:1] and,
++         * as its low bit, firstcond[0] for k = 0 or mask bit (4 - k) after;
++         * the lowest set bit of the mask ends the block. */
++        uint8_t fc = in->cond, m = in->it_mask & 0xF;
++        uint8_t n = (m & 1) ? 4 : (m & 2) ? 3 : (m & 4) ? 2 : 1;
++        s->cond[0] = fc;
++        for (uint8_t k = 1; k < n; k++)
++            s->cond[k] = (uint8_t)((fc & 0xE) | ((m >> (4 - k)) & 1));
++        s->n = n;
++        s->pos = 0;
++        s->next = in->addr + in->width;
++    }
++}
++
+ const char *arm_cond_name(uint8_t cond) {
+     static const char *n[16] = {
+         "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
+@@ -96,6 +127,8 @@ static void decode_t16(uint16_t h, arm_insn *o) {
+         o->rd = h & 7;
+         o->rm = (h >> 3) & 7;
+         o->imm = (h >> 6) & 0x1F;
++        /* LSR/ASR #0 is how the encoding writes a shift by 32. */
++        if (o->op != OP_LSL && o->imm == 0) o->imm = 32;
+         o->has_imm = 1;
+         o->sets_flags = 1;
+         set(o, A_ALU, "shift");
+@@ -273,9 +306,11 @@ static void decode_t16(uint16_t h, arm_insn *o) {
+     /* 1100 L rn rlist ΓÇö LDM / STM */
+     if ((h & 0xF000) == 0xC000) {
+         int load = (h & 0x0800) != 0;
++        o->op = load ? OP_LDM : OP_STM;
+         o->rn = (h >> 8) & 7;
+         o->reglist = h & 0xFF;
+-        o->writeback = 1;
++        /* LDMIA writes the base back only when the base is not also loaded. */
++        o->writeback = load ? !(o->reglist & (1u << o->rn)) : 1;
+         set(o, load ? A_LOADM : A_STOREM, "ldm/stm");
+         return;
+     }
+@@ -337,8 +372,11 @@ static void decode_t16(uint16_t h, arm_insn *o) {
+                 set(o, A_ALU, "extend");
+                 return;
+             }
+-            if ((h & 0xFF00) == 0xBA00 && ((h >> 6) & 3) != 1) {
+-                o->op = OP_REV;
++            /* op 0 REV, 1 REV16, 3 REVSH (2 is undefined). REVSH used to be
++             * decoded as a plain REV: right bytes, wrong width and no sign. */
++            if ((h & 0xFF00) == 0xBA00 && ((h >> 6) & 3) != 2) {
++                static const arm_op rv[4] = { OP_REV, OP_REV16, OP_NONE, OP_REVSH };
++                o->op = rv[(h >> 6) & 3];
+                 o->rd = h & 7;
+                 o->rm = (h >> 3) & 7;
+                 set(o, A_ALU, "rev");
+@@ -456,7 +494,9 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+          * and re-decoded them as register lists. Translation went DOWN. Worth
+          * recording: a change that claims more encodings can still be a
+          * regression if it claims the wrong ones. */
+-        if (W) {
++        /* ...and P=0 U=1 W=0, VLDMIA/VSTMIA without writeback, which is a
++         * list form too (P=0 W=0 U=0 is the 64-bit core transfer). */
++        if (W || (!P && U)) {
+             int vd_first = dp ? vfp_dreg(vd, D) : vfp_sreg(vd, D);
+             uint32_t n = (uint32_t)(h2 & 0xFF);
+             if (dp) n /= 2;
+@@ -472,6 +512,18 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+             set(o, L ? A_LOADM : A_STOREM, L ? "vldm/vpop" : "vstm/vpush");
+             return 1;
+         }
++        /* P=0 W=0 with bits 8:5 = 0010: VMOV between two core registers and a
++         * doubleword (or two consecutive singles). */
++        if (!P && !W && (h1 & 0xFFE0) == 0xEC40 && (h2 & 0x00D0) == 0x0010) {
++            int vm = h2 & 0xF, M = (h2 >> 5) & 1;
++            o->op  = L ? OP_VMOV_V_TO_RR : OP_VMOV_RR_TO_V;
++            o->rt  = (h2 >> 12) & 0xF;
++            o->rt2 = h1 & 0xF;
++            o->vm  = (int8_t)(dp ? vfp_dreg(vm, M) : vfp_sreg(vm, M));
++            if (!dp && o->vm == 31) return 0;     /* S31,S32 does not exist */
++            set(o, A_ALU, L ? "vmov r,r,d" : "vmov d,r,r");
++            return 1;
++        }
+         if (!P || W) return 0;
+ 
+         o->op  = L ? OP_VLDR : OP_VSTR;
+@@ -518,6 +570,26 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+         return 1;
+     }
+ 
++    /* --- VMOV between a core register and a 32-bit lane of a doubleword --- */
++    if (coproc == 11 && (h2 & 0x0F7F) == 0x0B10 &&
++        ((h1 & 0xFFD0) == 0xEE00 || (h1 & 0xFFD0) == 0xEE10)) {
++        int from = (h1 & 0x0010) != 0;
++        o->op = from ? OP_VMOV_SC_TO_C : OP_VMOV_C_TO_SC;
++        o->rt = (h2 >> 12) & 0xF;
++        o->vd = (int8_t)vfp_dreg(vn, (h2 >> 7) & 1);
++        o->imm = (h1 >> 5) & 1;                   /* lane */
++        set(o, A_ALU, from ? "vmov r,d[x]" : "vmov d[x],r");
++        return 1;
++    }
++
++    /* Data processing always has bit 4 clear. With it set the encoding is a
++     * register transfer, not arithmetic: `vdup.32 d20, r0` (0xEEC4 0B90) has
++     * the same opc1 as VDIV.F64 and was emitted as a double division, which
++     * broke MLB 15's screen-size computation (sub_813D826E: the menu clipped
++     * to 478x478). Leave it to the SIMD path, which runs VDUP from its
++     * encoding (neon_kind 3). */
++    if (h2 & 0x0010) return 0;
++
+     switch (opc1) {
+         case 0x0:
+             /* Multiply-accumulate. Previously declined on the grounds that
+@@ -534,13 +606,17 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+             set(o, A_ALU, op ? "vmls" : "vmla");
+             return 1;
+ 
+-        case 0x1:                                  /* VNMLA / VNMLS / VNMUL   */
+-            if (op) { o->op = OP_VNMUL; set(o, A_ALU, "vnmul"); return 1; }
+-            return 0;                              /* negated accumulate forms */
++        case 0x1:
++            /* VNMLS (op 0): d = n*m - d.  VNMLA (op 1): d = -(n*m) - d.
++             * VNMUL is NOT here ΓÇö it is opc1 0x2 with op set. Decoding VNMLA
++             * as VNMUL here, and VNMUL as VMUL below, flipped signs silently. */
++            o->op = op ? OP_VNMLA : OP_VNMLS;
++            set(o, A_ALU, op ? "vnmla" : "vnmls");
++            return 1;
+ 
+         case 0x2:
+-            o->op = OP_VMUL;
+-            set(o, A_ALU, "vmul");
++            o->op = op ? OP_VNMUL : OP_VMUL;
++            set(o, A_ALU, op ? "vnmul" : "vmul");
+             return 1;
+ 
+         case 0x3:
+@@ -557,6 +633,26 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+             int opc2 = h1 & 0xF;
+             int opc3 = (h2 >> 6) & 3;
+ 
++            /* VMOV.F32/F64 #imm: the constant is opc2:vm, expanded at emit time. */
++            if (opc3 == 0 && (h2 & 0x0030) == 0) {
++                o->op = OP_VMOV_IMM;
++                o->imm = (uint32_t)((opc2 << 4) | (h2 & 0xF));
++                o->has_imm = 1;
++                set(o, A_ALU, "vmov #imm");
++                return 1;
++            }
++
++            /* VCVT between precisions: the destination is the OTHER size, so
++             * the register fields are read with opposite numbering. */
++            if (opc2 == 0x7 && opc3 == 3) {
++                o->op = OP_VCVT_FF;
++                o->vfp_dp = (uint8_t)!dp;             /* destination precision */
++                o->vd = (int8_t)(dp ? vfp_sreg(vd, D) : vfp_dreg(vd, D));
++                o->vm = (int8_t)(dp ? vfp_dreg(vm, M) : vfp_sreg(vm, M));
++                set(o, A_ALU, dp ? "vcvt f32,f64" : "vcvt f64,f32");
++                return 1;
++            }
++
+             if (opc2 == 0x0 && opc3 == 1) { o->op = OP_VMOV;  set(o, A_ALU, "vmov"); return 1; }
+             if (opc2 == 0x0 && opc3 == 3) { o->op = OP_VABS;  set(o, A_ALU, "vabs"); return 1; }
+             if (opc2 == 0x1 && opc3 == 1) { o->op = OP_VNEG;  set(o, A_ALU, "vneg"); return 1; }
+@@ -576,7 +672,9 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+              * op bit rather than a separate field. */
+             if (opc2 == 0x8 && (opc3 & 1)) {
+                 o->op = OP_VCVT_I2F;
+-                o->vfp_unsigned = (uint8_t)(op == 0);
++                o->vm = (int8_t)vfp_sreg(vm, M);          /* the integer is in an S register */
++                /* Signedness is bit 7 of h2 (1 = signed); bit 6 is always 1 here. */
++                o->vfp_unsigned = (uint8_t)(((h2 >> 7) & 1) == 0);
+                 set(o, A_ALU, "vcvt f,i");
+                 return 1;
+             }
+@@ -587,7 +685,9 @@ static int decode_vfp(uint16_t h1, uint16_t h2, arm_insn *o) {
+              * explicit modelling to be right. */
+             if ((opc2 & 0xE) == 0xC && (opc3 & 1)) {
+                 o->op = OP_VCVT_F2I;
++                o->vd = (int8_t)vfp_sreg(vd, D);          /* the integer is in an S register */
+                 o->vfp_unsigned = (uint8_t)((opc2 & 1) == 0);
++                o->has_imm = (uint8_t)(((h2 >> 7) & 1) == 0);   /* bit 7 clear: VCVTR, FPSCR rounding */
+                 set(o, A_ALU, "vcvt i,f");
+                 return 1;
+             }
+@@ -651,6 +751,14 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+         return;
+     }
+ 
++    /* NEON element/structure loads and stores share 0xF9xx with the integer
++     * single load/store space, which would otherwise claim them and translate
++     * every VLD1/VST1 as a byte or halfword access to the wrong place. */
++    if ((h1 & 0xFF10) == 0xF900) {
++        set(o, A_SIMD, "neon ld/st");
++        return;
++    }
++
+     /* 11110 ... with bit 15 of the second halfword set: branches and
+      * miscellaneous control. */
+     if ((h1 & 0xF800) == 0xF000 && (h2 & 0x8000)) {
+@@ -728,9 +836,21 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+ 
+         /* Conditional B.W, or a system instruction when the condition field is
+          * 111x. */
+-        if (((h1 >> 7) & 0xE) == 0xE) { set(o, A_SYS, "sys"); return; }
++        if (h1 == 0xF3BF && (h2 & 0xFFF0) == 0x8F20) { o->op = OP_CLREX; set(o, A_SYS, "clrex"); return; }
++        if (h1 == 0xF3BF && (h2 & 0xFF00) == 0x8F00 &&
++            ((h2 >> 4) & 0xF) >= 4 && ((h2 >> 4) & 0xF) <= 6) { o->op = OP_BARRIER; set(o, A_SYS, "dmb/dsb/isb"); return; }
++        if (h1 == 0xF3AF && (h2 & 0xFF00) == 0x8000) { o->op = OP_NOP; set(o, A_SYS, "nop.w"); return; }
++        /* The condition field is h1 bits 9:6. Testing it with `(h1 >> 7) & 0xE`
++         * shifts one bit too far and makes cond=0xD (LE) look like 111x, so
++         * every `ble.w`/`bgt.w`-style wide conditional branch was trapped as
++         * `sys` and the program stopped on it (MLB 15 hit this at 0x813F7D56,
++         * `ble.w` back to 0x813F7B02). */
++        {
++            uint8_t cond = (uint8_t)((h1 >> 6) & 0xF);
++            if (cond >= 0xE) { set(o, A_SYS, "sys"); return; }
++            o->cond = cond;
++        }
+         o->op = OP_B;
+-        o->cond = (uint8_t)((h1 >> 6) & 0xF);
+         set(o, A_BRANCH, "b<cond>.w");
+         o->conditional = 1;
+         /* T3 has its own layout: a 6-bit high field rather than 10, and J1/J2
+@@ -746,6 +866,35 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+         return;
+     }
+ 
++    /* Exclusive access. LDREX/STREX word forms carry an offset; the byte and
++     * halfword forms share their encoding space with TBB/TBH. */
++    if ((h1 & 0xFFF0) == 0xE850 && (h2 & 0x0F00) == 0x0F00) {
++        o->op = OP_LDREX; o->ex_size = 4;
++        o->rn = h1 & 0xF; o->rt = (h2 >> 12) & 0xF;
++        o->imm = (uint32_t)(h2 & 0xFF) * 4u;
++        set(o, A_LOAD, "ldrex");
++        return;
++    }
++    if ((h1 & 0xFFF0) == 0xE840) {
++        o->op = OP_STREX; o->ex_size = 4;
++        o->rn = h1 & 0xF; o->rt = (h2 >> 12) & 0xF; o->rd = (h2 >> 8) & 0xF;
++        o->imm = (uint32_t)(h2 & 0xFF) * 4u;
++        set(o, A_STORE, "strex");
++        return;
++    }
++    if ((h1 & 0xFFF0) == 0xE8D0 && (h2 & 0x0FEF) == 0x0F4F) {
++        o->op = OP_LDREX; o->ex_size = (h2 & 0x0010) ? 2 : 1;
++        o->rn = h1 & 0xF; o->rt = (h2 >> 12) & 0xF; o->imm = 0;
++        set(o, A_LOAD, "ldrexb/h");
++        return;
++    }
++    if ((h1 & 0xFFF0) == 0xE8C0 && (h2 & 0x0FE0) == 0x0F40) {
++        o->op = OP_STREX; o->ex_size = (h2 & 0x0010) ? 2 : 1;
++        o->rn = h1 & 0xF; o->rt = (h2 >> 12) & 0xF; o->rd = h2 & 0xF; o->imm = 0;
++        set(o, A_STORE, "strexb/h");
++        return;
++    }
++
+     /* Load/store DUAL. Bit 6 separates these from the multiple forms below, and
+      * the earlier mask excluded them by keeping that bit ΓÇö so every LDRD/STRD
+      * fell through to unknown. They are common: compilers use them to move
+@@ -759,6 +908,9 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+         o->imm = (uint32_t)(h2 & 0xFF) * 4u;   /* scaled by 4 */
+         o->has_imm = 1;
+         o->mem_add = (h1 & 0x0080) != 0;       /* U bit */
++        /* P (bit 8) and W (bit 5): `strd r4, r5, [sp, #-8]!` and
++         * `ldrd r4, r5, [sp], #8` move the base register. */
++        o->idx_mode = (uint8_t)(!(h1 & 0x0100) ? 2 : ((h1 & 0x0020) ? 1 : 0));
+         set(o, load ? A_LOAD : A_STORE, load ? "ldrd" : "strd");
+         return;
+     }
+@@ -766,15 +918,33 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+     /* Load/store multiple. LDM with the PC in the list is a return. */
+     if ((h1 & 0xFE40) == 0xE800) {
+         int load = (h1 & 0x0010) != 0;
+-        if (load && (h2 & 0x8000)) { set(o, A_RETURN, "ldm {..,pc}"); return; }
+-        o->op = load ? OP_POP : OP_PUSH;
++        if (load && (h2 & 0x8000)) {
++            /* POP.W {..,pc}: LDMIA sp! with the PC in the list. It is a return,
++             * but the other registers in the list are restored on the way out,
++             * so it must carry the list. Returning as a bare `return;` left
++             * r4-r11 holding the callee's values in every function that saved
++             * more than the 16-bit PUSH can encode. */
++            if ((h1 & 0x000F) == 13 && (h1 & 0x0020) && (h1 & 0x0180) == 0x0080) {
++                o->op = OP_POP;
++                o->rn = 13;
++                o->reglist = h2;
++                o->writeback = 1;
++                set(o, A_RETURN, "pop.w {..,pc}");
++            } else {
++                set(o, A_INDIRECT, "ldm {..,pc}");   /* not stack-shaped: trap */
++            }
++            return;
++        }
+         o->rn = h1 & 0xF;
+         o->reglist = h2;
+         o->writeback = (h1 & 0x0020) != 0;
+-        /* Only the SP-relative writeback forms are PUSH/POP proper; the rest
+-         * are general LDM/STM against an arbitrary base and the emitter's
+-         * stack-shaped translation would be wrong for them. */
+-        if (o->rn != 13) o->op = OP_NONE;
++        o->ldm_db = (h1 & 0x0180) == 0x0100;
++        /* Only LDMIA sp! and STMDB sp! are POP and PUSH; every other form is a
++         * general LDM/STM against its base, translated as such. */
++        if (o->rn == 13 && o->writeback && load && !o->ldm_db)      o->op = OP_POP;
++        else if (o->rn == 13 && o->writeback && !load && o->ldm_db) o->op = OP_PUSH;
++        else if ((h1 & 0x0180) == 0x0080 || (h1 & 0x0180) == 0x0100) o->op = load ? OP_LDM : OP_STM;
++        else o->op = OP_NONE;
+         set(o, load ? A_LOADM : A_STOREM, "ldm/stm.w");
+         return;
+     }
+@@ -833,7 +1003,7 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+                        && (opf == 0x0 || opf == 0x4 || opf == 0x8 || opf == 0xD);
+             if (compare) {
+                 if (opf == 0x0) o->op = OP_TST;
+-                if (opf == 0x4) o->op = OP_TST;   /* teq: same shape for us */
++                if (opf == 0x4) o->op = OP_TEQ;   /* exclusive-or test, not AND */
+                 if (opf == 0x8) o->op = OP_CMN;
+                 if (opf == 0xD) o->op = OP_CMP;
+                 o->rd = ARM_NO_REG;
+@@ -854,6 +1024,10 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+             o->rm = h2 & 0xF;
+             o->shift_type = (h2 >> 4) & 3;
+             o->shift_amt  = (uint8_t)((((h2 >> 12) & 7) << 2) | ((h2 >> 6) & 3));
++            /* LSR/ASR #0 encode #32. ROR #0 is RRX, which keeps amount 0 and
++             * is recognised by type 3 with no amount. */
++            if ((o->shift_type == 1 || o->shift_type == 2) && o->shift_amt == 0)
++                o->shift_amt = 32;
+         }
+         set(o, A_ALU, "alu.w");
+         return;
+@@ -951,7 +1125,18 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+      * a return. */
+     if ((h1 & 0xFE00) == 0xF800) {
+         int load = (h1 & 0x0010) != 0;
+-        if (load && ((h2 >> 12) & 0xF) == 0xF) { set(o, A_RETURN, "ldr pc"); return; }
++        if (load && ((h2 >> 12) & 0xF) == 0xF) {
++            /* LDR pc, [sp], #4 is POP {pc} in its 32-bit form: the stack
++             * pointer moves too, which a bare `return;` lost. */
++            if (h1 == 0xF85D && h2 == 0xFB04) {
++                o->op = OP_POP;
++                o->rn = 13;
++                o->reglist = 0x8000;
++                o->writeback = 1;
++            }
++            set(o, A_RETURN, "ldr pc");
++            return;
++        }
+ 
+         int size = (h1 >> 5) & 3;                 /* 0 byte, 1 half, 2 word */
+         int sign = (h1 & 0x0100) != 0;
+@@ -963,19 +1148,28 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+                         : size == 1 ? (sign ? OP_LDRSH : OP_LDRH) : OP_LDR;
+         else      o->op = size == 0 ? OP_STRB : size == 1 ? OP_STRH : OP_STR;
+ 
+-        if (h1 & 0x0080) {                        /* 12-bit unsigned offset */
++        if (o->rn == 15) {                        /* literal: U is bit 7 of h1 */
++            o->imm = h2 & 0xFFF;
++            o->has_imm = 1;
++            o->mem_add = (h1 & 0x0080) != 0;
++        } else if (h1 & 0x0080) {                 /* 12-bit unsigned offset */
+             o->imm = h2 & 0xFFF;
+             o->has_imm = 1;
+-        } else if ((h2 & 0x0F00) == 0x0C00) {     /* 8-bit, negative */
++        } else if (h2 & 0x0800) {
++            /* 8-bit immediate with P, U, W in bits 10:8. Pre-indexed with
++             * writeback (`str r0, [sp, #-4]!`) and post-indexed
++             * (`ldr r0, [r1], #4`) both move the base; reading every one of
++             * them as a plain offset lost that update. */
++            int P = (h2 >> 10) & 1, U = (h2 >> 9) & 1, W = (h2 >> 8) & 1;
+             o->imm = h2 & 0xFF;
+             o->has_imm = 1;
+-            o->mem_add = 0;
+-        } else if ((h2 & 0x0FC0) == 0x0000) {     /* register offset */
++            o->mem_add = (uint8_t)U;
++            o->idx_mode = (uint8_t)(!P ? 2 : (W ? 1 : 0));
++        } else if ((h2 & 0x0FC0) == 0x0000) {     /* register offset, LSL #0-3 */
+             o->rm = h2 & 0xF;
+             o->shift_amt = (uint8_t)((h2 >> 4) & 3);
+         } else {
+-            o->imm = h2 & 0xFF;
+-            o->has_imm = 1;
++            o->op = OP_NONE;                      /* undefined encoding */
+         }
+         set(o, load ? A_LOAD : A_STORE, "ldr/str.w");
+         return;
+@@ -983,21 +1177,47 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+ 
+     /* The wide sign/zero extends: rn == 15 distinguishes them from the
+      * extend-and-add forms that share the encoding. */
+-    if ((h1 & 0xFF80) == 0xFA00 && (h1 & 0x000F) == 0x000F &&
+-        (h2 & 0xF080) == 0xF080) {
+-        static const arm_op ex[4] = { OP_SXTH, OP_UXTH, OP_SXTB, OP_UXTB };
+-        o->op = ex[(h1 >> 4) & 3];
++    /* The field is three bits: 0 SXTH, 1 UXTH, 2 SXTB16, 3 UXTB16, 4 SXTB,
++     * 5 UXTB. Indexing a four-entry table with `& 3` turned every UXTB.W
++     * into UXTH and every SXTB.W into SXTH. The rotation (bits 5:4, in bytes)
++     * selects which byte or halfword is extracted ΓÇö `uxtb.w r0, r4, ror #8`
++     * is how compiled code reads byte 1 of a word ΓÇö and was ignored too.
++     * With rn != 15 these are the extend-and-add forms (UXTAB, SXTAH...). */
++    if ((h1 & 0xFF80) == 0xFA00 && (h2 & 0xF0C0) == 0xF080) {
++        static const arm_op ex[8] = { OP_SXTH, OP_UXTH, OP_NONE, OP_NONE, OP_SXTB, OP_UXTB, OP_NONE, OP_NONE };
++        o->op = ex[(h1 >> 4) & 7];
+         o->rd = (h2 >> 8) & 0xF;
+         o->rm = h2 & 0xF;
+-        set(o, A_ALU, "extend.w");
++        o->rn = (h1 & 0xF) == 15 ? ARM_NO_REG : (int8_t)(h1 & 0xF);
++        o->shift_type = SH_ROR;
++        o->shift_amt = (uint8_t)(((h2 >> 4) & 3) * 8);
++        set(o, A_ALU, o->rn == ARM_NO_REG ? "extend.w" : "extend-add.w");
+         return;
+     }
+ 
++    /* Miscellaneous: REV / REV16 / RBIT / REVSH and CLZ. Rm appears in both
++     * halves; the second copy is the one the architecture reads. */
++    if ((h1 & 0xFFE0) == 0xFAA0 || (h1 & 0xFFF0) == 0xFA90) {
++        if ((h2 & 0xF080) == 0xF080) {
++            int op1 = (h1 >> 4) & 3, op2 = (h2 >> 4) & 3;
++            o->rd = (h2 >> 8) & 0xF;
++            o->rm = h2 & 0xF;
++            if (op1 == 1) {
++                static const arm_op r[4] = { OP_REV, OP_REV16, OP_RBIT, OP_REVSH };
++                o->op = r[op2];
++                set(o, A_ALU, "rev/rbit.w");
++                return;
++            }
++            if (op1 == 3 && op2 == 0) { o->op = OP_CLZ; set(o, A_ALU, "clz"); return; }
++        }
++    }
++
+     /* Table branch: a jump table in one instruction, indexing a byte or
+      * halfword array to compute a forward branch. It is a computed transfer
+      * that discovery cannot follow, and is named here rather than left unknown
+      * so its cost is visible. */
+     if ((h1 & 0xFFF0) == 0xE8D0 && (h2 & 0xFFE0) == 0xF000) {
++        o->op = (h2 & 0x10) ? OP_TBH : OP_TBB;
+         o->rn = h1 & 0xF;
+         o->rm = h2 & 0xF;
+         set(o, A_INDIRECT, "tbb/tbh");
+@@ -1028,7 +1248,33 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
+             set(o, A_ALU, "mul.w");
+             return;
+         }
+-        set(o, A_ALU, "mla/mls");
++        o->op = OP_MLA;
++        o->rd = (h2 >> 8) & 0xF;
++        o->rn = h1 & 0xF;
++        o->rm = h2 & 0xF;
++        o->rt = (h2 >> 12) & 0xF;                /* ra */
++        set(o, A_ALU, "mla");
++        return;
++    }
++    if ((h1 & 0xFFF0) == 0xFB00 && (h2 & 0x00F0) == 0x0010) {
++        o->op = OP_MLS;
++        o->rd = (h2 >> 8) & 0xF;
++        o->rn = h1 & 0xF;
++        o->rm = h2 & 0xF;
++        o->rt = (h2 >> 12) & 0xF;
++        set(o, A_ALU, "mls");
++        return;
++    }
++    if ((h2 & 0x00F0) == 0x0000 &&
++        ((h1 & 0xFFF0) == 0xFBA0 || (h1 & 0xFFF0) == 0xFB80 ||
++         (h1 & 0xFFF0) == 0xFBE0 || (h1 & 0xFFF0) == 0xFBC0)) {
++        uint16_t k = h1 & 0xFFF0;
++        o->op = k == 0xFBA0 ? OP_UMULL : k == 0xFB80 ? OP_SMULL : k == 0xFBE0 ? OP_UMLAL : OP_SMLAL;
++        o->rn = h1 & 0xF;
++        o->rm = h2 & 0xF;
++        o->rt = (h2 >> 12) & 0xF;                /* lo */
++        o->rt2 = (h2 >> 8) & 0xF;                /* hi */
++        set(o, A_ALU, "mul long");
+         return;
+     }
+ 
+@@ -1176,3 +1422,31 @@ int arm_decode(const uint8_t *code, uint32_t code_addr, uint32_t code_len,
+     decode_t32(h1, rd16le(code + off + 2), out);
+     return 4;
+ }
++
++int arm_table_targets(const uint8_t *code, uint32_t code_addr, uint32_t code_len,
++                      const arm_insn *in, uint32_t count, uint32_t *out, int max) {
++    if ((in->op != OP_TBB && in->op != OP_TBH) || in->rn != 15) return 0;
++    const uint32_t table = in->addr + 4;
++    const uint32_t step  = in->op == OP_TBH ? 2u : 1u;
++    uint32_t first = 0xFFFFFFFFu;   /* lowest target so far: the table ends there */
++    int n = 0;
++    for (uint32_t i = 0; n < max; i++) {
++        if (count && i >= count) break;
++        uint32_t ea = table + i * step;
++        if (ea + step > first) break;
++        if (ea < code_addr || ea + step > code_addr + code_len) break;
++        const uint8_t *p = code + (ea - code_addr);
++        uint32_t e = step == 2 ? (uint32_t)(p[0] | (p[1] << 8)) : p[0];
++        uint32_t t = table + 2 * e;
++        if (t < table + (i + 1) * step || t >= code_addr + code_len) {
++            /* A bounded table with a bad first entry is not a table. A bad
++             * entry after good ones means the bound overshot (the index was
++             * adjusted in a way not tracked): keep what was read. */
++            if (count && n == 0) return 0;
++            break;
++        }
++        if (t < first) first = t;
++        out[n++] = t;
++    }
++    return n;
++}
+diff --git a/tools/armrecomp/decode.h b/tools/armrecomp/decode.h
+index 4630e94..1a8ab1e 100644
+--- a/tools/armrecomp/decode.h
++++ b/tools/armrecomp/decode.h
+@@ -66,6 +66,14 @@ typedef enum {
+     OP_SXTB, OP_SXTH, OP_UXTB, OP_UXTH, OP_REV,
+     OP_IT, OP_NOP, OP_SVC, OP_CBZ, OP_CBNZ,
+     OP_SBFX, OP_UBFX, OP_BFI, OP_BFC,
++    OP_TBB, OP_TBH,
++    OP_MLA, OP_MLS,                     /* rd = ra(rt) +/- rn * rm             */
++    OP_UMULL, OP_SMULL, OP_UMLAL, OP_SMLAL, /* rt = lo, rt2 = hi              */
++    OP_LDM, OP_STM,                     /* general multiple, any base          */
++    OP_LDREX, OP_STREX, OP_CLREX,       /* exclusive access; ex_size bytes     */
++    OP_BARRIER,                         /* DMB / DSB / ISB                     */
++    OP_CLZ, OP_RBIT, OP_REV16, OP_REVSH,
++    OP_TEQ,
+ 
+     /* Scalar VFP. Not vector work ΓÇö 82% of this platform's coprocessor traffic
+      * is ordinary floating point, and it maps onto C almost one to one. */
+@@ -81,6 +89,13 @@ typedef enum {
+     OP_VLDM, OP_VSTM,   /* register-list float load/store, incl. VPUSH/VPOP */
+     OP_VMLA, OP_VMLS,   /* multiply-accumulate: vd = vd +/- (vn * vm)       */
+     OP_VNMUL,
++    OP_VNMLA, OP_VNMLS, /* d = -(n*m) - d ;  d = n*m - d                      */
++    OP_VMOV_IMM,        /* vd = VFPExpandImm(imm8)                         */
++    OP_VCVT_FF,         /* f32 <-> f64; vfp_dp = destination is double      */
++    OP_VMOV_SC_TO_C,    /* rt = Dn[imm] (32-bit lane)                      */
++    OP_VMOV_C_TO_SC,    /* Dd[imm] = rt                                    */
++    OP_VMOV_RR_TO_V,    /* Dm (or Sm,Sm+1) = rt:rt2, rt the low word        */
++    OP_VMOV_V_TO_RR,    /* rt, rt2 = Dm (or Sm, Sm+1)                       */
+ } arm_op;
+ 
+ /* Shift types, in the architecture's encoding order. */
+@@ -127,12 +142,29 @@ typedef struct {
+ 
+     /* Bitfield ops. Kept out of `imm`/`shift_amt` because a field named for
+      * something else is how a reader ends up trusting the wrong one. */
++    uint8_t    ex_size;         /* LDREX/STREX: 1, 2 or 4                 */
++    uint8_t    idx_mode;        /* loads/stores: 0 offset, 1 pre-index with
++                                 * writeback, 2 post-index (base, then wb) */
++    uint8_t    ldm_db;          /* LDM/STM: decrement before              */
+     uint8_t    bf_lsb;
+     uint8_t    bf_width;
+ } arm_insn;
+ 
+ const char *arm_cond_name(uint8_t cond);
+ 
++/* IT block state for a linear walk. arm_decode sees one instruction at a time
++ * and cannot know it sits inside an IT block, so every walker feeds each
++ * decoded instruction through arm_it_apply, in address order:
++ *   - an IT instruction loads the conditions of the next 1-4 instructions;
++ *   - each of those gets its condition (cond, and conditional for branches
++ *     and returns, which then no longer end the flow), and the 16-bit forms
++ *     that set flags outside IT stop doing so (CMP/CMN/TST still do).
++ * A jump to elsewhere ends the block: call arm_it_reset at every new block
++ * start (the architecture forbids branching into the middle of one). */
++typedef struct { uint8_t cond[4]; uint8_t n, pos; uint32_t next; } arm_it;
++void arm_it_reset(arm_it *s);
++void arm_it_apply(arm_it *s, arm_insn *in);
++
+ const char *arm_class_name(arm_class c);
+ 
+ /* Decode one instruction at `addr` from `code` (which begins at `code_addr`).
+@@ -144,4 +176,12 @@ const char *arm_class_name(arm_class c);
+ int arm_decode(const uint8_t *code, uint32_t code_addr, uint32_t code_len,
+                uint32_t addr, arm_mode mode, arm_insn *out);
+ 
++/* Targets of a TBB/TBH whose table follows the instruction (base register pc).
++ * `count` is the entry count from a guarding `cmp rm, #n` (n + 1), or 0 when
++ * unknown, in which case the table is taken to end where the first target
++ * begins. Returns the number of targets written to `out`, 0 for a table that
++ * cannot be read statically. */
++int arm_table_targets(const uint8_t *code, uint32_t code_addr, uint32_t code_len,
++                      const arm_insn *in, uint32_t count, uint32_t *out, int max);
++
+ #endif /* ARMRECOMP_DECODE_H */
+diff --git a/tools/armrecomp/emit.c b/tools/armrecomp/emit.c
+index 5fa36ab..fbee08f 100644
+--- a/tools/armrecomp/emit.c
++++ b/tools/armrecomp/emit.c
+@@ -17,10 +17,13 @@
+  */
+ 
+ #include "emit.h"
++#include "../../include/vitarecomp/neon.h"     /* neon_kind, shared with the runtime */
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ 
++extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA (definida en main.c): depuraci├│n dirigida */
++
+ #define MAX_INSNS_PER_FUNC 65536
+ 
+ static const char *reg_name(int r) {
+@@ -78,7 +81,7 @@ static int fb_has_label(const fbody *b, uint32_t addr) {
+  * it is not a body.
+  */
+ 
+-#define VISIT_SLOTS 8192
++#define VISIT_SLOTS 65536
+ 
+ typedef struct { uint32_t k[VISIT_SLOTS]; } visited;
+ 
+@@ -128,38 +131,190 @@ static int fs_has(const funcset *s, uint32_t addr) {
+     return 0;
+ }
+ 
+-static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
++/* First function start after `addr`, or 0. */
++static uint32_t fs_next(const funcset *s, uint32_t addr) {
++    uint32_t lo = 0, hi = s->n;
++    while (lo < hi) {
++        uint32_t mid = (lo + hi) / 2;
++        if (s->v[mid] <= addr) lo = mid + 1; else hi = mid;
++    }
++    return lo < s->n ? s->v[lo] : 0;
++}
++
++/* Addresses promoted to functions of their own (see collect). Open addressing,
++ * plus the insertion order so the caller can walk the new ones. */
++typedef struct { uint32_t *k; uint32_t cap; uint32_t *list; uint32_t n, lcap; } xset;
++
++static int xs_has(const xset *s, uint32_t a) {
++    if (!s || !s->n) return 0;
++    for (uint32_t h = (a * 2654435761u) & (s->cap - 1);; h = (h + 1) & (s->cap - 1)) {
++        if (s->k[h] == a) return 1;
++        if (s->k[h] == 0) return 0;
++    }
++}
++
++static void xs_add(xset *s, uint32_t a) {
++    uint32_t h = (a * 2654435761u) & (s->cap - 1);
++    while (s->k[h] && s->k[h] != a) h = (h + 1) & (s->cap - 1);
++    if (s->k[h] == a || s->n >= s->cap / 2) return;   /* present, or full: leave it */
++    s->k[h] = a;
++    if (s->n == s->lcap) {
++        s->lcap = s->lcap ? s->lcap * 2 : 4096;
++        s->list = (uint32_t *)realloc(s->list, s->lcap * sizeof(uint32_t));
++    }
++    s->list[s->n++] = a;
++}
++
++/* How far a function's walk may treat code as its own.
++ *
++ * A function registered because something called it may have been walked by
++ * discovery only briefly ΓÇö its recorded extent can be zero or tiny. The body is
++ * still real, so fall back to a generous bound and let control flow terminate
++ * the walk, which it does at the first return.
++ *
++ * Discovery's extent is where ITS walk stopped, and that walk stops at anything
++ * another function's walk already decoded ΓÇö so a long function whose epilogue
++ * is shared by many paths can come out cut short. Functions are laid out
++ * contiguously, so the code up to the next function start past the extent
++ * still belongs to this one (stray starts inside the body do not count).
++ *
++ * Computed once from discovery's functions and frozen: the promoted entries
++ * added later must not move any bound, or the pre-pass and the emit would
++ * disagree about which branches leave a function. */
++static uint32_t fn_bound(const vf_func *fn, const funcset *fs0) {
++    uint32_t bound = (fn->end > fn->addr + 16) ? fn->end : fn->addr + 8192;
++    uint32_t next = fs_next(fs0, bound - 1);
++    if (next > bound) bound = next;
++    return bound;
++}
++
++/* Walk one function's body.
++ *
++ * Flow that leaves `bound` either reaches a known function ΓÇö a tail call ΓÇö or
++ * code that belongs to no known function. Following that code inline copied it
++ * into every function that reached it: the output grew from 14.5 M to 24 M
++ * instructions and the build from 4 to 15 minutes. Instead it is PROMOTED: with
++ * `pend` set (the pre-pass) the address is recorded and becomes a function of
++ * its own, emitted once, and the branch or fall-through to it is a tail call.
++ * Entering guest code at any instruction boundary through a C call is sound ΓÇö
++ * registers and stack are guest state, and its return returns for us.
++ *
++ * `known` must be the final function set in the emit pass; then no promotion
++ * is pending and the old inline-follow path is only a fallback. */
++static void collect(const vm_image *img, const vf_func *fn, uint32_t bound,
++                    const funcset *known, const funcset *real, xset *pend, fbody *b) {
+     const uint8_t *text = img->data + img->seg_file;
+     const uint32_t base = img->seg_vaddr;
+ 
+     visited seen;
+     memset(&seen, 0, sizeof(seen));
+ 
+-    /* A function registered because something called it may have been walked
+-     * by discovery only briefly ΓÇö its recorded extent can be zero or tiny. The
+-     * body is still real, so fall back to a generous bound and let control flow
+-     * terminate the walk, which it does at the first return. Extent is a
+-     * safety limit here, not the definition of the body. */
+-    uint32_t bound = (fn->end > fn->addr + 16) ? fn->end : fn->addr + 8192;
+-
+-    uint32_t stack[512];
++    /* Pending block starts. Large and static: a 512-entry stack silently dropped
++     * targets in long functions, leaving their branches with no label. */
++    static uint32_t stack[65536];
+     int sp_ = 0;
+     stack[sp_++] = fn->addr;
+ 
+     while (sp_ > 0 && b->n < MAX_INSNS_PER_FUNC) {
+         uint32_t a = stack[--sp_];
++        extern uint32_t g_dbg_trace_addr;
++        if (g_dbg_trace_addr && a == g_dbg_trace_addr)
++            fprintf(stderr, "[collect] pop objetivo %08X fn=%08X\n", a, fn->addr);
++        arm_it its;
++        arm_it_reset(&its);              /* a new block never starts inside IT */
++        int cmp_reg = -1;
++        uint32_t cmp_imm = 0;
++        int prev_reg = -1, lo_check = 0;
++        uint32_t prev_imm = 0;
+ 
+         for (;;) {
+             if (a < base || a >= base + img->seg_len) break;
+-            if (a >= bound) break;                   /* extent as a bound */
+-            if (!visit_mark(&seen, a)) break;        /* already emitted */
++            if (a + 0x10000u <= fn->addr || a >= fn->addr + 0x10000u) break;
++            if (visit_mark(&seen, a)) {
++                extern uint32_t g_dbg_trace_addr;
++                if (g_dbg_trace_addr && (a == g_dbg_trace_addr || a + 2 == g_dbg_trace_addr || a + 4 == g_dbg_trace_addr))
++                    fprintf(stderr, "[collect] visita %08X\n", a);
++            } else {
++                extern uint32_t g_dbg_trace_addr;
++                if (g_dbg_trace_addr && (a == g_dbg_trace_addr || a + 2 == g_dbg_trace_addr || a + 4 == g_dbg_trace_addr))
++                    fprintf(stderr, "[collect] %08X YA EMITIDO aqu├¡ paro\n", a);
++                break;        /* already emitted */
++            }
++
++            /* Past the extent, flow that reaches a known function start is a
++             * fall-through into it: emit it as an explicit tail call. Stopping
++             * there silently instead ended the C function ΓÇö a `return` the
++             * guest never executed. Anywhere else past the extent is still this
++             * function's code (the extent is cut short by stray starts). */
++            /* A REAL function start (a call target or export, not a shape guess)
++             * reached inside the bound is another function: discovery's extent
++             * routinely spans several, and walking into them copied each one
++             * into every function whose extent covered it ΓÇö 3.7 copies of every
++             * instruction on average. Shape-heuristic starts are still walked
++             * through: they can sit inside a loop, and splitting there would
++             * make every iteration a nested C call. */
++            int real_a = a != fn->addr && fs_has(real, a);
++            int known_a = fs_has(known, a) || xs_has(pend, a);
++            if (a >= bound && !known_a && pend) { xs_add(pend, a); known_a = 1; }
++            if (real_a || (a >= bound && known_a)) {
++                arm_insn ft;
++                memset(&ft, 0, sizeof(ft));
++                ft.addr = a;
++                ft.mode = fn->mode;
++                ft.op = OP_B;
++                ft.cls = A_BRANCH;
++                ft.cond = ARM_COND_AL;
++                ft.has_target = 1;
++                ft.target = a;
++                ft.rd = ft.rn = ft.rm = ft.rt = ft.rt2 = ARM_NO_REG;
++                ft.vd = ft.vn = ft.vm = ARM_NO_REG;
++                ft.mnemonic = "fall-through";
++                fb_push(b, &ft);
++                break;
++            }
+ 
+             arm_insn in;
+             int n = arm_decode(text, base, img->seg_len, a, fn->mode, &in);
+             if (n == 0) break;
++            arm_it_apply(&its, &in);
++            /* `cmp r0, #0x50; bgt out; cmp r0, #0x1f; ble out; subs r0, #0x20; tbh`: the
++             * second cmp is a LOWER bound. Taking it as the count read 32 of 49 entries.
++             * A cmp whose very next instruction branches on le/lt/ls/lo keeps the upper
++             * bound already known for that register. */
++            if (lo_check) {
++                lo_check = 0;
++                if (in.cls == A_BRANCH && in.has_target && prev_reg == cmp_reg &&
++                    (in.cond == 0xD || in.cond == 0xB || in.cond == 0x9 || in.cond == 0x3)) cmp_imm = prev_imm;
++            }
++            if (in.op == OP_CMP && in.has_imm) {
++                prev_reg = cmp_reg; prev_imm = cmp_imm;
++                cmp_reg = in.rn; cmp_imm = in.imm; lo_check = 1;
++            }
++            /* `cmp r2, #44; ...; subs r2, #10; tbb [pc, r2]`: the index is 0..34. Reading 45
++             * entries ran into the padding after the table and the table was dropped. */
++            else if (in.op == OP_SUB && in.has_imm && cmp_reg >= 0 && in.rn == cmp_reg && in.imm <= cmp_imm) {
++                cmp_imm -= in.imm;
++                cmp_reg = in.rd;
++            }
++            if (in.op == OP_TBB || in.op == OP_TBH) {
++                /* A jump table: every entry is a block of this function. The
++                 * entry count travels in `imm` so the emitter reads the same
++                 * table back. */
++                uint32_t tt[1024];
++                uint32_t cnt = (cmp_reg == in.rm) ? cmp_imm + 1 : 0;
++                int nt = arm_table_targets(text, base, img->seg_len, &in, cnt, tt, 1024);
++                in.imm = (uint32_t)nt;
++                fb_push(b, &in);
++                for (int k = 0; k < nt; k++) {
++                    if (tt[k] < fn->addr) continue;      /* targets were validated by the reader */
++                    fb_label(b, tt[k]);
++                    if (sp_ < (int)(sizeof(stack) / sizeof(stack[0]))) stack[sp_++] = tt[k];
++                }
++                break;
++            }
+             fb_push(b, &in);
+ 
+-            if (in.cls == A_RETURN) break;
++            if (in.cls == A_RETURN && !in.conditional) break;   /* `bxeq lr` in IT falls through */
+ 
+             /* `bound`, not `fn->end`.
+              *
+@@ -176,9 +331,24 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
+              * trapped: 2,547 instructions, and every one of them an ordinary
+              * intra-function branch that had already been translated correctly
+              * a few lines above. */
++            /* Past the bound, a branch to a known function start is a tail
++             * call and the emitter calls it. A branch anywhere else is still
++             * this function's code ΓÇö the bound was cut short by a stray start
++             * inside the body (shape heuristics find many) ΓÇö so it is followed
++             * too, within 64 KB, rather than left to trap. */
++            int near = in.has_target && in.target + 0x10000u > fn->addr &&
++                       in.target < fn->addr + 0x10000u &&
++                       in.target >= base && in.target < base + img->seg_len;
++            int out_known = in.has_target &&
++                            (fs_has(known, in.target) || xs_has(pend, in.target));
++            if (in.has_target && in.cls == A_BRANCH && near && pend && !out_known &&
++                !(in.target >= fn->addr && in.target < bound))
++                xs_add(pend, in.target);              /* promote: emitted as a tail call */
+             if (in.has_target && in.cls == A_BRANCH &&
+-                in.target >= fn->addr && in.target < bound) {
++                ((in.target >= fn->addr && in.target < bound) ||
++                 (!pend && !out_known && near))) {
+                 fb_label(b, in.target);
++                if (in.target == 0x8129990E) { extern uint32_t g_dbg_trace_addr; if (g_dbg_trace_addr) fprintf(stderr, "[collect] etiqueta %08X desde %08X (cond=%d alumno bound=%08X)\n", in.target, in.addr, in.conditional, bound); }
+                 if (sp_ < (int)(sizeof(stack) / sizeof(stack[0])))
+                     stack[sp_++] = in.target;
+                 if (!in.conditional) break;          /* flow ends here */
+@@ -214,13 +384,15 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
+     uint32_t kept = 0;
+     for (uint32_t i = 0; i < b->nlabels; i++) {
+         int placed = 0;
+-        uint32_t lo = 0, hi = b->n;
+-        while (lo < hi) {                      /* body is sorted by address */
++        uint32_t lo = 0, hi = b->n;        while (lo < hi) {                      /* body is sorted by address */
+             uint32_t mid = lo + (hi - lo) / 2;
+             if (b->v[mid].addr == b->labels[i]) { placed = 1; break; }
+             if (b->v[mid].addr <  b->labels[i]) lo = mid + 1; else hi = mid;
+         }
+         if (placed) b->labels[kept++] = b->labels[i];
++        else if (g_dbg_trace_addr && b->labels[i] == g_dbg_trace_addr)
++            fprintf(stderr, "[collect] etiqueta %08X descartada: bloque no coleccionado (fn=%08X insns=%u)\n",
++                    b->labels[i], fn->addr, b->n);
+     }
+     b->nlabels = kept;
+ }
+@@ -274,6 +446,10 @@ static void operand2(char *dst, size_t cap, const arm_insn *in) {
+         return;
+     }
+     if (in->rm == 15) { reg_operand(dst, cap, 15, in); return; }
++    if (in->shift_type == SH_ROR && in->shift_amt == 0) {    /* RRX */
++        snprintf(dst, cap, "(((uint32_t)flag_c << 31) | (%s >> 1))", src_name(in, in->rm));
++        return;
++    }
+     static const char *fn[4] = { "vita_lsl", "vita_lsr", "vita_asr", "vita_ror" };
+     snprintf(dst, cap, "%s(%s, %u)", fn[in->shift_type & 3],
+              src_name(in, in->rm), in->shift_amt);
+@@ -300,9 +476,16 @@ static int address(char *dst, size_t cap, const arm_insn *in) {
+     /* The U bit is not decoration: the T32 8-bit form encodes [rN, #-imm]
+      * with the same fields as the positive one, so ignoring it reads from the
+      * wrong side of the base register. */
+-    if (in->has_imm && in->imm)
++    if (in->idx_mode == 2)                       /* post-index: the base itself */
++        snprintf(dst, cap, "%s", src_name(in, in->rn));
++    else if (in->has_imm && in->imm)
+         snprintf(dst, cap, "%s %c 0x%X", src_name(in, in->rn),
+                  in->mem_add ? '+' : '-', in->imm);
++    else if (in->rm != ARM_NO_REG && in->shift_amt)
++        /* `[rn, rm, lsl #2]` is how every word array is indexed. Dropping
++         * the shift read element i/4 instead of element i. */
++        snprintf(dst, cap, "%s + (%s << %u)", src_name(in, in->rn), src_name(in, in->rm),
++                 in->shift_amt);
+     else if (in->rm != ARM_NO_REG)
+         snprintf(dst, cap, "%s + %s", src_name(in, in->rn), src_name(in, in->rm));
+     else
+@@ -353,6 +536,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+                      const arm_insn *in, FILE *f, emit_stats *st) {
+     char o2[64], addr[64], rn_s[32];
+ 
++    /* A MOVW/MOVT the loader would relocate to an imported variable: build
++     * that variable's cell address instead of the linker's placeholder. */
++    arm_insn reloc;
++    const vm_varref *vr = vm_find_varref(mod, in->addr);
++    if (vr && (in->op == OP_MOV || in->op == OP_MOVT) && in->has_imm) {
++        reloc = *in;
++        reloc.imm = vr->hi ? (vr->cell >> 16) : (vr->cell & 0xFFFFu);
++        in = &reloc;
++        st->varrefs++;
++    }
++
+     /* The first operand, with r15 resolved. Computed once because several
+      * paths below need it and the ternary for "rn defaults to rd" is easy to
+      * get inconsistently wrong when repeated. */
+@@ -417,6 +611,21 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+         guarded = 1;
+     }
+ 
++    /* Flag-setting logical operations take C from the barrel shifter when
++     * the second operand is a shifted register. Computed before the
++     * destination is written, since rd is often rm. */
++    int shc = in->sets_flags && !in->has_imm && in->rm != ARM_NO_REG && in->rm != 15 &&
++              (in->shift_amt || in->shift_type == SH_ROR) &&
++              (in->op == OP_MOV || in->op == OP_MVN || in->op == OP_AND || in->op == OP_ORR ||
++               in->op == OP_EOR || in->op == OP_BIC || in->op == OP_TST || in->op == OP_TEQ);
++    if (shc) {
++        if (in->shift_type == SH_ROR && in->shift_amt == 0)
++            fprintf(f, "    { int _shc = (int)(%s & 1);\n", src_name(in, in->rm));
++        else
++            fprintf(f, "    { int _shc = vita_shift_c(%u, %s, %u, flag_c);\n",
++                    in->shift_type, src_name(in, in->rm), in->shift_amt);
++    }
++
+     int ok = 1;
+     switch (in->op) {
+         case OP_MOV:
+@@ -476,7 +685,11 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+         }
+ 
+         case OP_RSB:
+-            fprintf(f, "    { uint32_t _a = 0, _b = %s;\n", src_name(in, in->rn));
++            /* rd = operand2 - rn. The 16-bit NEG form decodes as operand2 = #0;
++             * hard-wiring 0 here turned every RSB #imm (rsbs r1, r1, #31) into
++             * a negate. */
++            operand2(o2, sizeof(o2), in);
++            fprintf(f, "    { uint32_t _a = %s, _b = %s;\n", o2, src_name(in, in->rn));
+             fprintf(f, "      %s = _a - _b;\n", reg_name(in->rd));
+             if (in->sets_flags)
+                 fprintf(f, "      vita_flags_sub(_a, _b, %s);\n", reg_name(in->rd));
+@@ -499,20 +712,34 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             static const char *fn2[4] = { "vita_lsl", "vita_lsr", "vita_asr", "vita_ror" };
+             int which = in->op == OP_LSL ? 0 : in->op == OP_LSR ? 1
+                       : in->op == OP_ASR ? 2 : 3;
+-            const char *src = src_name(in, in->rm == ARM_NO_REG ? in->rd : in->rm);
+-            if (in->has_imm)
+-                fprintf(f, "    %s = %s(%s, %u);\n", reg_name(in->rd),
+-                        fn2[which], src, in->imm);
+-            else
+-                fprintf(f, "    %s = %s(%s, %s & 0xFF);\n", reg_name(in->rd),
+-                        fn2[which], reg_name(in->rd), src_name(in, in->rm));
+-            if (in->sets_flags) fprintf(f, "    vita_flags_nz(%s);\n", reg_name(in->rd));
++            /* Immediate form: the value is rm. Register form: the value is rn
++             * (the 16-bit form decodes rn = rd) and rm is the amount; shifting rd
++             * instead was wrong for every LSL.W/LSR.W rd, rn, rm. */
++            char amt[64];
++            const char *src;
++            if (in->has_imm) {
++                src = src_name(in, in->rm == ARM_NO_REG ? in->rd : in->rm);
++                snprintf(amt, sizeof(amt), "%u", in->imm);
++            } else {
++                src = src_name(in, in->rn != ARM_NO_REG ? in->rn : in->rd);
++                snprintf(amt, sizeof(amt), "(%s & 0xFF)", src_name(in, in->rm));
++            }
++            /* Through temporaries: the carry needs the original value and amount. */
++            fprintf(f, "    { uint32_t _x = %s, _s = %s;\n", src, amt);
++            fprintf(f, "      %s = %s(_x, _s);\n", reg_name(in->rd), fn2[which]);
++            if (in->sets_flags) {
++                fprintf(f, "      vita_flags_nz(%s);\n", reg_name(in->rd));
++                fprintf(f, "      flag_c = vita_shift_c(%d, _x, _s, flag_c);\n", which);
++            }
++            fprintf(f, "    }\n");
+             break;
+         }
+ 
+         case OP_MUL:
++            /* rd = rn * rm. The 16-bit form decodes rn = rd, so this covers both;
++             * multiplying by rd instead ignored the first operand of every MUL.W. */
+             fprintf(f, "    %s = %s * %s;\n", reg_name(in->rd),
+-                    reg_name(in->rd), src_name(in, in->rm));
++                    src_name(in, in->rn != ARM_NO_REG ? in->rn : in->rd), src_name(in, in->rm));
+             if (in->sets_flags) fprintf(f, "    vita_flags_nz(%s);\n", reg_name(in->rd));
+             break;
+ 
+@@ -525,10 +752,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+                     in->op == OP_CMP ? '-' : '+');
+             break;
+ 
+-        case OP_TST:
++        case OP_TST: case OP_TEQ:
+             operand2(o2, sizeof(o2), in);
+-            fprintf(f, "    vita_flags_nz(%s & %s);\n",
+-                    rn_s, o2);
++            fprintf(f, "    vita_flags_nz(%s %c %s);\n",
++                    rn_s, in->op == OP_TEQ ? '^' : '&', o2);
+             break;
+ 
+         case OP_ADR:
+@@ -544,10 +771,16 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+              * code later. */
+             if (in->rn == 15) {
+                 uint32_t pc = (in->addr + 4) & ~3u;
+-                const uint8_t *p = vm_va(img, pc + in->imm, 4);
++                uint32_t at = in->mem_add ? pc + in->imm : pc - in->imm;
++                int sz = in->op == OP_LDR ? 4 : (in->op == OP_LDRH || in->op == OP_LDRSH) ? 2 : 1;
++                const uint8_t *p = vm_va(img, at, (uint32_t)sz);
+                 if (p) {
+-                    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+-                               | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++                    uint32_t v = sz == 4 ? (uint32_t)p[0] | ((uint32_t)p[1] << 8)
++                                         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)
++                               : sz == 2 ? (uint32_t)p[0] | ((uint32_t)p[1] << 8) : p[0];
++                    if (in->op == OP_LDRSB) v = (uint32_t)(int32_t)(int8_t)v;
++                    if (in->op == OP_LDRSH) v = (uint32_t)(int32_t)(int16_t)v;
++                    if (in->rt == 15) { ok = 0; break; }
+                     fprintf(f, "    %s = 0x%08X;  /* literal */\n", reg_name(in->rt), v);
+                     st->literals++;
+                     break;
+@@ -558,6 +791,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+                            : in->op == OP_LDRH  ? "vita_read16(%s)"
+                            : in->op == OP_LDRSB ? "vita_sxtb(vita_read8(%s))"
+                                                 : "vita_sxth(vita_read16(%s))";
++            if (in->rt == 15) { ok = 0; break; }
++            if (in->idx_mode) {
++                /* The base moves: through a temporary, so a loaded register
++                 * that is also the base cannot change the address. */
++                fprintf(f, "    { uint32_t _ea = %s;\n      %s = ", addr, reg_name(in->rt));
++                fprintf(f, rd, "_ea");
++                fprintf(f, ";\n      %s = _ea", reg_name(in->rn));
++                if (in->idx_mode == 2) fprintf(f, " %c 0x%X", in->mem_add ? '+' : '-', in->imm);
++                fprintf(f, "; }\n");
++                break;
++            }
+             fprintf(f, "    %s = ", reg_name(in->rt));
+             fprintf(f, rd, addr);
+             fprintf(f, ";\n");
+@@ -580,13 +824,20 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             char base[64];
+             if (!address(base, sizeof(base), in)) { ok = 0; trap(f, in, "ldrd/strd addr"); break; }
+ 
++            fprintf(f, "    { uint32_t _ea = %s;\n", base);
+             if (in->op == OP_LDRD) {
+-                fprintf(f, "    %s = vita_read32(%s);\n", reg_name(in->rt), base);
+-                fprintf(f, "    %s = vita_read32((%s) + 4);\n", reg_name(in->rt2), base);
++                fprintf(f, "      %s = vita_read32(_ea);\n", reg_name(in->rt));
++                fprintf(f, "      %s = vita_read32(_ea + 4);\n", reg_name(in->rt2));
+             } else {
+-                fprintf(f, "    vita_write32(%s, %s);\n", base, reg_name(in->rt));
+-                fprintf(f, "    vita_write32((%s) + 4, %s);\n", base, reg_name(in->rt2));
++                fprintf(f, "      vita_write32(_ea, %s);\n", reg_name(in->rt));
++                fprintf(f, "      vita_write32(_ea + 4, %s);\n", reg_name(in->rt2));
++            }
++            if (in->idx_mode && in->rn != 15) {
++                fprintf(f, "      %s = _ea", reg_name(in->rn));
++                if (in->idx_mode == 2) fprintf(f, " %c 0x%X", in->mem_add ? '+' : '-', in->imm);
++                fprintf(f, ";\n");
+             }
++            fprintf(f, "    }\n");
+             break;
+         }
+ 
+@@ -594,7 +845,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             if (!address(addr, sizeof(addr), in)) { ok = 0; trap(f, in, "store addr"); break; }
+             const char *w = in->op == OP_STR ? "vita_write32"
+                           : in->op == OP_STRB ? "vita_write8" : "vita_write16";
+-            fprintf(f, "    %s(%s, %s);\n", w, addr, reg_name(in->rt));
++            { char rv[64]; reg_operand(rv, sizeof(rv), in->rt, in);
++              if (in->idx_mode) {
++                  fprintf(f, "    { uint32_t _ea = %s;\n      %s(_ea, %s);\n      %s = _ea",
++                          addr, w, rv, reg_name(in->rn));
++                  if (in->idx_mode == 2) fprintf(f, " %c 0x%X", in->mem_add ? '+' : '-', in->imm);
++                  fprintf(f, "; }\n");
++              } else {
++                  fprintf(f, "    %s(%s, %s);\n", w, addr, rv);
++              } }
+             break;
+         }
+ 
+@@ -637,7 +896,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             const char *fn3 = in->op == OP_SXTB ? "vita_sxtb"
+                             : in->op == OP_SXTH ? "vita_sxth"
+                             : in->op == OP_UXTB ? "vita_uxtb" : "vita_uxth";
+-            fprintf(f, "    %s = %s(%s);\n", reg_name(in->rd), fn3, src_name(in, in->rm));
++            /* Wide forms may rotate the source first and may add rn (UXTAB...).
++             * The 16-bit forms decode with no rotation and rn = ARM_NO_REG. */
++            char src[64];
++            if (in->shift_amt) snprintf(src, sizeof(src), "vita_ror(%s, %u)", src_name(in, in->rm), in->shift_amt);
++            else               snprintf(src, sizeof(src), "%s", src_name(in, in->rm));
++            if (in->rn != ARM_NO_REG && in->width == 4)
++                fprintf(f, "    %s = %s + %s(%s);\n", reg_name(in->rd), src_name(in, in->rn), fn3, src);
++            else
++                fprintf(f, "    %s = %s(%s);\n", reg_name(in->rd), fn3, src);
+             break;
+         }
+ 
+@@ -645,6 +912,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             fprintf(f, "    %s = vita_rev(%s);\n", reg_name(in->rd), src_name(in, in->rm));
+             break;
+ 
++        case OP_REV16: case OP_REVSH: case OP_RBIT: case OP_CLZ:
++            fprintf(f, "    %s = %s(%s);\n", reg_name(in->rd),
++                    in->op == OP_REV16 ? "vita_rev16" : in->op == OP_REVSH ? "vita_revsh"
++                  : in->op == OP_RBIT ? "vita_rbit" : "vita_clz", src_name(in, in->rm));
++            break;
++
+         case OP_SBFX: case OP_UBFX:
+             fprintf(f, "    %s = %s(%s, %u, %u);\n", reg_name(in->rd),
+                     in->op == OP_SBFX ? "vita_sbfx" : "vita_ubfx",
+@@ -670,6 +943,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             break;
+ 
+         case OP_B:
++            if (in->width == 0) {        /* synthetic fall-through into a known function */
++                fprintf(f, "    vita_func_%08X(); return;\n", in->target);
++                break;
++            }
+             if (fb_has_label(b, in->target)) {
+                 if (in->cond == ARM_COND_AL) fprintf(f, "    goto L_%08X;\n", in->target);
+                 else fprintf(f, "    if (vita_cond(%u)) goto L_%08X;\n",
+@@ -700,6 +977,13 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+              * translation. BX is a tail transfer and does not come back; BLX is
+              * a call and does. */
+             if (in->rm == ARM_NO_REG) { ok = 0; break; }
++            /* MLB 15 port: `bx lr` / `mov pc, lr` are returns. Calls are emitted
++             * as C calls (`bl` does not set lr), so lr never holds the guest
++             * return address and dispatching to it jumps to garbage. */
++            if (in->op == OP_BX && in->cls == A_RETURN) {
++                fprintf(f, "    return;\n");
++                break;
++            }
+             /* Through reg_operand, not reg_name. `bx pc` is a real (if odd)
+              * instruction, and as a SOURCE the PC is a constant this pass
+              * knows ΓÇö resolving it is correct where naming it would not
+@@ -795,9 +1079,9 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             for (uint32_t k = 0; k < words; k++) {
+                 int reg = (in->vfp_dp ? in->vd * 2 : in->vd) + (int)k;
+                 if (in->op == OP_VLDM)
+-                    fprintf(f, "    vfp_s[%d].u = vita_read32(%s + %u);\n", reg & 31, rn, k * 4);
++                    fprintf(f, "    vfp_s[%d].u = vita_read32(%s + %u);\n", reg & 63, rn, k * 4);
+                 else
+-                    fprintf(f, "    vita_write32(%s + %u, vfp_s[%d].u);\n", rn, k * 4, reg & 31);
++                    fprintf(f, "    vita_write32(%s + %u, vfp_s[%d].u);\n", rn, k * 4, reg & 63);
+             }
+             if (in->mem_add && in->writeback)
+                 fprintf(f, "    %s += %u;\n", rn, words * 4);
+@@ -816,6 +1100,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             break;
+         }
+ 
++        case OP_VNMLA: case OP_VNMLS: {
++            if (in->vd == ARM_NO_REG || in->vn == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
++            const char *g = in->vfp_dp ? "vfp_getd" : "vfp_getf";
++            const char *s = in->vfp_dp ? "vfp_setd" : "vfp_setf";
++            if (in->op == OP_VNMLA)
++                fprintf(f, "    %s(%d, -(%s(%d) * %s(%d)) - %s(%d));\n", s, in->vd, g, in->vn, g, in->vm, g, in->vd);
++            else
++                fprintf(f, "    %s(%d, (%s(%d) * %s(%d)) - %s(%d));\n", s, in->vd, g, in->vn, g, in->vm, g, in->vd);
++            break;
++        }
++
+         case OP_VNMUL:
+             if (in->vd == ARM_NO_REG || in->vn == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
+             if (in->vfp_dp)
+@@ -835,8 +1130,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+             /* Clearing the sign bit rather than calling fabs: it is the
+              * architecture's definition, and it preserves NaN payloads where
+              * a library call need not. */
+-            if (in->vfp_dp) fprintf(f, "    vfp_setd(%d, vfp_getd(%d) < 0.0 ? -vfp_getd(%d) : vfp_getd(%d));\n",
+-                                    in->vd, in->vm, in->vm, in->vm);
++            /* Double: clear bit 31 of the high word, the same rule as single
++             * precision (a `x < 0 ? -x : x` got -0.0 wrong, and its `?` was
++             * taken by fix_recomp.py for the unknown-operand placeholder). */
++            if (in->vfp_dp) fprintf(f, "    vfp_s[%d].u = vfp_s[%d].u; vfp_s[%d].u = vfp_s[%d].u & 0x7FFFFFFFu;\n",
++                                    (in->vd * 2) & 63, (in->vm * 2) & 63,
++                                    (in->vd * 2 + 1) & 63, (in->vm * 2 + 1) & 63);
+             else            fprintf(f, "    vfp_setu(%d, vfp_getu(%d) & 0x7FFFFFFFu);\n", in->vd, in->vm);
+             break;
+ 
+@@ -880,18 +1179,154 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+ 
+         case OP_VCVT_I2F:
+             if (in->vd == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
+-            fprintf(f, "    vfp_setf(%d, (float)(%s)vfp_getu(%d));\n",
+-                    in->vd, in->vfp_unsigned ? "uint32_t" : "int32_t", in->vm);
++            if (in->vfp_dp)
++                fprintf(f, "    vfp_setd(%d, (double)(%s)vfp_getu(%d));\n",
++                        in->vd, in->vfp_unsigned ? "uint32_t" : "int32_t", in->vm);
++            else
++                fprintf(f, "    vfp_setf(%d, (float)(%s)vfp_getu(%d));\n",
++                        in->vd, in->vfp_unsigned ? "uint32_t" : "int32_t", in->vm);
++            break;
++
++        case OP_VMOV_IMM: {
++            /* VFPExpandImm: sign, an exponent built from NOT(b6):b6 repeated:b5:4,
++             * and four fraction bits. Folded to the exact bits here. */
++            uint32_t i8 = in->imm & 0xFF, b6 = (i8 >> 6) & 1;
++            if (in->vfp_dp) {
++                uint32_t hi = ((i8 >> 7) << 31) | ((b6 ^ 1) << 30) | (b6 ? 0x3FC00000u : 0)
++                            | (((i8 >> 4) & 3) << 20) | ((i8 & 0xF) << 16);
++                fprintf(f, "    vfp_s[%d].u = 0u; vfp_s[%d].u = 0x%08Xu;\n",
++                        (in->vd * 2) & 63, (in->vd * 2 + 1) & 63, hi);
++            } else {
++                uint32_t v = ((i8 >> 7) << 31) | ((b6 ^ 1) << 30) | (b6 ? 0x3E000000u : 0)
++                           | (((i8 >> 4) & 3) << 23) | ((i8 & 0xF) << 19);
++                fprintf(f, "    vfp_setu(%d, 0x%08Xu);\n", in->vd, v);
++            }
++            break;
++        }
++
++        case OP_VCVT_FF:
++            if (in->vfp_dp) fprintf(f, "    vfp_setd(%d, (double)vfp_getf(%d));\n", in->vd, in->vm);
++            else            fprintf(f, "    vfp_setf(%d, (float)vfp_getd(%d));\n", in->vd, in->vm);
++            break;
++
++        case OP_VMOV_SC_TO_C:
++            fprintf(f, "    %s = vfp_s[%d].u;\n", reg_name(in->rt), (in->vd * 2 + (int)in->imm) & 63);
+             break;
+ 
++        case OP_VMOV_C_TO_SC:
++            fprintf(f, "    vfp_s[%d].u = %s;\n", (in->vd * 2 + (int)in->imm) & 63, src_name(in, in->rt));
++            break;
++
++        case OP_VMOV_RR_TO_V: {
++            int w = in->vfp_dp ? in->vm * 2 : in->vm;
++            fprintf(f, "    vfp_s[%d].u = %s; vfp_s[%d].u = %s;\n", w & 63, src_name(in, in->rt),
++                    (w + 1) & 63, src_name(in, in->rt2));
++            break;
++        }
++
++        case OP_VMOV_V_TO_RR: {
++            int w = in->vfp_dp ? in->vm * 2 : in->vm;
++            fprintf(f, "    %s = vfp_s[%d].u; %s = vfp_s[%d].u;\n", reg_name(in->rt), w & 63,
++                    reg_name(in->rt2), (w + 1) & 63);
++            break;
++        }
++
+         case OP_VCVT_F2I:
+             if (in->vd == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
+             /* Toward zero, which is what a C cast does ΓÇö the only rounding
+              * mode claimed by the decoder for exactly that reason. */
+-            fprintf(f, "    vfp_setu(%d, (uint32_t)(%s)vfp_getf(%d));\n",
+-                    in->vd, in->vfp_unsigned ? "uint32_t" : "int32_t", in->vm);
++            {
++                const char *src = in->vfp_dp ? "vfp_getd" : "vfp_getf";
++                /* Saturating, as the hardware is; a C cast is undefined out of range. */
++                const char *cv  = in->vfp_unsigned ? "vfp_cvt_u32" : "vfp_cvt_s32";
++                if (in->has_imm)    /* VCVTR: FPSCR rounding, round-to-nearest-even by default */
++                    fprintf(f, "    vfp_setu(%d, %s(nearbyint((double)%s(%d))));\n",
++                            in->vd, cv, src, in->vm);
++                else
++                    fprintf(f, "    vfp_setu(%d, %s(trunc((double)%s(%d))));\n", in->vd, cv, src, in->vm);
++            }
++            break;
++
++        case OP_MLA: case OP_MLS:
++            fprintf(f, "    %s = %s %c %s * %s;\n", reg_name(in->rd), src_name(in, in->rt),
++                    in->op == OP_MLA ? '+' : '-', src_name(in, in->rn), src_name(in, in->rm));
++            break;
++
++        case OP_UMULL: case OP_SMULL: case OP_UMLAL: case OP_SMLAL: {
++            int sgn = in->op == OP_SMULL || in->op == OP_SMLAL;
++            int acc = in->op == OP_UMLAL || in->op == OP_SMLAL;
++            if (sgn)
++                fprintf(f, "    { uint64_t _p = (uint64_t)((int64_t)(int32_t)%s * (int64_t)(int32_t)%s);\n",
++                        src_name(in, in->rn), src_name(in, in->rm));
++            else
++                fprintf(f, "    { uint64_t _p = (uint64_t)%s * (uint64_t)%s;\n",
++                        src_name(in, in->rn), src_name(in, in->rm));
++            if (acc)
++                fprintf(f, "      _p += ((uint64_t)%s << 32) | %s;\n",
++                        src_name(in, in->rt2), src_name(in, in->rt));
++            fprintf(f, "      %s = (uint32_t)_p; %s = (uint32_t)(_p >> 32); }\n",
++                    reg_name(in->rt), reg_name(in->rt2));
++            break;
++        }
++
++        case OP_LDM: case OP_STM: {
++            int count = 0;
++            for (int i = 0; i < 16; i++) if (in->reglist & (1u << i)) count++;
++            /* PC as the base or in the list, or SP in the list, is UNPREDICTABLE
++             * or a transfer: in practice it is data decoded as code. Trap. */
++            if (in->rn == 15 || (in->reglist & 0xA000)) { ok = 0; break; }
++            /* _b is the lowest address touched; DB forms start count words down. */
++            fprintf(f, "    { uint32_t _b = %s - %d;\n", src_name(in, in->rn),
++                    in->ldm_db ? count * 4 : 0);
++            int slot = 0;
++            for (int i = 0; i < 16; i++) {
++                if (!(in->reglist & (1u << i))) continue;
++                if (in->op == OP_LDM)
++                    fprintf(f, "      %s = vita_read32(_b + %d);\n", reg_name(i), slot * 4);
++                else {
++                    char rv[64]; reg_operand(rv, sizeof(rv), i, in);
++                    fprintf(f, "      vita_write32(_b + %d, %s);\n", slot * 4, rv);
++                }
++                slot++;
++            }
++            if (in->writeback && !(in->op == OP_LDM && (in->reglist & (1u << in->rn))))
++                fprintf(f, "      %s = _b + %d;\n", reg_name(in->rn), in->ldm_db ? 0 : count * 4);
++            fprintf(f, "    }\n");
++            break;
++        }
++
++        case OP_LDREX:
++            fprintf(f, "    %s = vita_ldrex(%s + 0x%X, %d);\n", reg_name(in->rt),
++                    src_name(in, in->rn), in->imm, in->ex_size);
++            break;
++
++        case OP_STREX:
++            fprintf(f, "    %s = vita_strex(%s + 0x%X, %s, %d);\n", reg_name(in->rd),
++                    src_name(in, in->rn), in->imm, src_name(in, in->rt), in->ex_size);
++            break;
++
++        case OP_CLREX:
++            fprintf(f, "    vita_clrex();\n");
+             break;
+ 
++        case OP_BARRIER:
++            fprintf(f, "    /* barrier */\n");
++            break;
++
++        case OP_TBB: case OP_TBH: {
++            uint32_t tt[1024];
++            int nt = in->imm ? arm_table_targets(img->data + img->seg_file, img->seg_vaddr,
++                                                 img->seg_len, in, in->imm, tt, 1024) : 0;
++            if (nt == 0) { ok = 0; break; }
++            fprintf(f, "    switch (%s) {\n", src_name(in, in->rm));
++            for (int k = 0; k < nt; k++) {
++                if (fb_has_label(b, tt[k])) fprintf(f, "    case %d: goto L_%08X;\n", k, tt[k]);
++                else fprintf(f, "    case %d: vita_trap_indirect(0x%08X, 0x%08X); return;\n", k, in->addr, tt[k]);
++            }
++            fprintf(f, "    default: vita_trap_indirect(0x%08X, 0); return;\n    }\n", in->addr);
++            break;
++        }
++
+         case OP_NOP:
+             fprintf(f, "    /* nop */\n");
+             break;
+@@ -923,6 +1358,39 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+         } else if (in->cls == A_CALL || in->cls == A_INDIRECT) {
+             fprintf(f, "    vita_trap_indirect(0x%08X, 0);\n", in->addr);
+             note_trap(st, "indirect transfer");
++        } else if (in->cls == A_SIMD && neon_kind(in->raw)) {
++            /* NEON runs in the runtime from its encoding (neon.h). */
++            uint32_t h1 = in->raw >> 16, h2 = in->raw & 0xFFFF;
++            int rt = (int)((h2 >> 12) & 15), rn = (int)(h1 & 15), rm = (int)(h2 & 15);
++            switch (neon_kind(in->raw)) {
++                case 1:
++                    fprintf(f, "    neon_dp(0x%08Xu, 0x%08Xu);\n", in->addr, in->raw);
++                    ok = 1;
++                    break;
++                case 2:
++                    if (rn == 15) break;
++                    fprintf(f, "    { uint32_t _nb = neon_ldst(0x%08Xu, 0x%08Xu, %s);",
++                            in->addr, in->raw, reg_name(rn));
++                    if (rm == 13)      fprintf(f, " %s += _nb;", reg_name(rn));
++                    else if (rm != 15) fprintf(f, " %s += %s;", reg_name(rn), reg_name(rm));
++                    fprintf(f, " (void)_nb; }\n");
++                    ok = 1;
++                    break;
++                case 3: case 4:
++                    if (rt == 15) break;
++                    fprintf(f, "    %s(0x%08Xu, %s);\n",
++                            neon_kind(in->raw) == 3 ? "neon_dup_core" : "neon_set_lane",
++                            in->raw, reg_name(rt));
++                    ok = 1;
++                    break;
++                case 5:
++                    if (rt == 15) break;
++                    fprintf(f, "    %s = neon_get_lane(0x%08Xu);\n", reg_name(rt), in->raw);
++                    ok = 1;
++                    break;
++            }
++            if (!ok) { trap(f, in, "simd"); note_trap(st, "simd/vfp"); }
++            else st->neon++;
+         } else if (in->cls == A_SIMD) {
+             trap(f, in, "simd");
+             note_trap(st, "simd/vfp");
+@@ -932,6 +1400,7 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+         }
+     }
+ 
++    if (shc) fprintf(f, "    flag_c = _shc; }\n");
+     if (guarded) fprintf(f, "    }\n");
+     return ok;
+ }
+@@ -956,6 +1425,83 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+     for (uint32_t i = 0; i < disc->count; i++) fs.v[i] = disc->funcs[i].addr;
+     qsort(fs.v, fs.n, sizeof(uint32_t), fs_cmp);
+ 
++    /* Entries: discovery's functions, then the addresses the pre-pass promotes
++     * (see collect). Bounds are computed against discovery's set and frozen. */
++    uint32_t n_ent = disc->count, cap_ent = disc->count + 4096;
++    vf_func  *ent   = (vf_func *)malloc(cap_ent * sizeof(vf_func));
++    uint32_t *bnd   = (uint32_t *)malloc(cap_ent * sizeof(uint32_t));
++    if (!ent || !bnd) return 1;
++    for (uint32_t i = 0; i < disc->count; i++) {
++        ent[i] = disc->funcs[i];
++        bnd[i] = fn_bound(&ent[i], &fs);
++    }
++
++    /* Starts that are certainly functions: found as call targets or exports. */
++    funcset real;
++    real.n = 0;
++    real.v = (uint32_t *)malloc((disc->count ? disc->count : 1) * sizeof(uint32_t));
++    if (!real.v) return 1;
++    for (uint32_t i = 0; i < disc->count; i++) {
++        uint32_t a = disc->funcs[i].addr;
++        int sure = !disc->funcs[i].from_heuristic;
++        /* A shape-found start that opens with PUSH / PUSH.W is a prologue:
++         * compiled code does not save registers in the middle of a loop. */
++        const uint8_t *p = vm_va(img, a, 2);
++        if (!sure && p && disc->funcs[i].mode == ARM_T32) {
++            uint16_t h = (uint16_t)(p[0] | (p[1] << 8));
++            sure = (h & 0xFE00) == 0xB400 || h == 0xE92D;
++        }
++        if (sure) real.v[real.n++] = a;
++    }
++    qsort(real.v, real.n, sizeof(uint32_t), fs_cmp);
++    {
++        xset pend;
++        memset(&pend, 0, sizeof(pend));
++        pend.cap = 1u << 21;
++        pend.k = (uint32_t *)calloc(pend.cap, sizeof(uint32_t));
++        if (!pend.k) return 1;
++        uint32_t taken = 0;
++        for (uint32_t i = 0; i < n_ent; i++) {
++            if (i < disc->count && i >= n_funcs) continue;   /* not emitted under --limit */
++            fbody pb;
++            memset(&pb, 0, sizeof(pb));
++            collect(img, &ent[i], bnd[i], &fs, &real, &pend, &pb);
++            free(pb.v);
++            free(pb.labels);
++            for (; taken < pend.n; taken++) {
++                uint32_t a = pend.list[taken];
++                if (fs_has(&fs, a)) continue;
++                if (n_ent == cap_ent) {
++                    cap_ent *= 2;
++                    ent = (vf_func *)realloc(ent, cap_ent * sizeof(vf_func));
++                    bnd = (uint32_t *)realloc(bnd, cap_ent * sizeof(uint32_t));
++                    if (!ent || !bnd) return 1;
++                }
++                memset(&ent[n_ent], 0, sizeof(vf_func));
++                ent[n_ent].addr = a;
++                ent[n_ent].mode = ent[i].mode;
++                ent[n_ent].from_heuristic = 1;
++                /* Up to the next discovered start: the code between belongs to
++                 * nobody else. */
++                uint32_t nx = fs_next(&fs, a);
++                bnd[n_ent] = (nx && nx < a + 8192) ? nx : a + 8192;
++                ent[n_ent].end = bnd[n_ent];
++                n_ent++;
++            }
++        }
++        st->promoted = n_ent - disc->count;
++        free(pend.k);
++        free(pend.list);
++    }
++
++    /* The final set, used by every emit decision and the dispatch table. */
++    free(fs.v);
++    fs.n = n_ent;
++    fs.v = (uint32_t *)malloc((n_ent ? n_ent : 1) * sizeof(uint32_t));
++    if (!fs.v) return 1;
++    for (uint32_t i = 0; i < n_ent; i++) fs.v[i] = ent[i].addr;
++    qsort(fs.v, fs.n, sizeof(uint32_t), fs_cmp);
++
+     fprintf(f, "/* Generated by armrecomp. Do not edit.\n");
+     fprintf(f, " *\n");
+     fprintf(f, " * module: %s\n", mod->info.name);
+@@ -980,8 +1526,8 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+ 
+     /* Forward declarations: the call graph has cycles, so every function must
+      * be visible before any body is emitted. */
+-    for (uint32_t i = 0; i < disc->count; i++)
+-        fprintf(f, "void vita_func_%08X(void);\n", disc->funcs[i].addr);
++    for (uint32_t i = 0; i < n_ent; i++)
++        fprintf(f, "void vita_func_%08X(void);\n", ent[i].addr);
+     fprintf(f, "\n");
+ 
+     /* A limited emit still references functions it did not emit, so those get
+@@ -995,11 +1541,12 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+         fprintf(f, "\n");
+     }
+ 
+-    for (uint32_t i = 0; i < n_funcs; i++) {
+-        const vf_func *fn = &disc->funcs[i];
++    for (uint32_t i = 0; i < n_ent; i++) {
++        if (i < disc->count && i >= n_funcs) continue;       /* stubbed above */
++        const vf_func *fn = &ent[i];
+         fbody b;
+         memset(&b, 0, sizeof(b));
+-        collect(img, fn, &b);
++        collect(img, fn, bnd[i], &fs, &real, NULL, &b);
+ 
+         fprintf(f, "/* ---------------------------------------------------------------\n");
+         fprintf(f, " * vita_func_%08X  --  %u instructions, %u bytes%s\n",
+@@ -1008,8 +1555,36 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+         fprintf(f, " * ------------------------------------------------------------- */\n");
+         fprintf(f, "void vita_func_%08X(void) {\n", fn->addr);
+ 
++        /* Overlapping decodes (MLB 15 port, 2026-11-07).
++         *
++         * A jump table read past its end (the index bound is not always visible
++         * to the walk) yields entries that point into the MIDDLE of real
++         * instructions; each becomes a label and a second, bogus decode. Sorted
++         * by address, that bogus instruction lands right after the real one it
++         * overlaps, so the real one's fall-through ran into it: `bl` at
++         * 0x81769F8C returned into a trap decoded at 0x81769F8E instead of
++         * continuing at 0x81769F90 (Franchise/RTTS simulation). Fall-through
++         * now jumps explicitly to the true next address whenever the next
++         * emitted instruction does not start there. */
++        for (uint32_t k = 0; k + 1 < b.n; k++) {
++            const arm_insn *p = &b.v[k];
++            uint32_t end = p->addr + p->width;
++            if (b.v[k + 1].addr >= end) continue;
++            for (uint32_t j = k + 1; j < b.n && b.v[j].addr <= end; j++)
++                if (b.v[j].addr == end) { fb_label(&b, end); break; }
++        }
+         for (uint32_t k = 0; k < b.n; k++) {
+             const arm_insn *in = &b.v[k];
++            if (k > 0) {
++                const arm_insn *p = &b.v[k - 1];
++                uint32_t end = p->addr + p->width;
++                int ends_flow = (p->cls == A_BRANCH || p->cls == A_RETURN || p->cls == A_INDIRECT) && !p->conditional;
++                if (p->op == OP_TBB || p->op == OP_TBH) ends_flow = 1;
++                if (in->addr < end && !ends_flow && fb_has_label(&b, end)) {
++                    fprintf(f, "    goto L_%08X;   /* fall-through past an overlapping decode */\n", end);
++                    st->overlaps++;
++                }
++            }
+             if (fb_has_label(&b, in->addr))
+                 fprintf(f, "L_%08X:\n", in->addr);
+ 
+@@ -1139,9 +1714,26 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+     fprintf(f, "void vita_register_functions(void) {\n");
+     fprintf(f, "    vita_dispatch_init(vita_functions,\n");
+     fprintf(f, "        (uint32_t)(sizeof(vita_functions) / sizeof(vita_functions[0])));\n");
+-    fprintf(f, "}\n");
++    fprintf(f, "}\n\n");
++
++    /* Imported variables: every MOVW/MOVT that reaches one was emitted with
++     * its cell's address (module.h); the host fills the cells by NID. */
++    fprintf(f, "/* imported variables -- %u, %u references; the host fills each cell */\n",
++            mod->var_count, mod->varref_count);
++    fprintf(f, "const vita_import_var vita_import_vars[] = {\n");
++    for (uint32_t i = 0; i < mod->var_count; i++)
++        fprintf(f, "    { 0x%08Xu, 0x%08Xu, 0x%08Xu },  /* %s */\n", mod->vars[i].lib_nid,
++                mod->vars[i].nid, mod->vars[i].cell,
++                nid_func_name(db, mod->vars[i].lib_nid, mod->vars[i].nid)
++                    ? nid_func_name(db, mod->vars[i].lib_nid, mod->vars[i].nid) : "?");
++    if (!mod->var_count) fprintf(f, "    { 0, 0, 0 }\n");
++    fprintf(f, "};\n");
++    fprintf(f, "const uint32_t vita_import_var_count = %uu;\n", mod->var_count);
+ 
+     free(fs.v);
++    free(ent);
++    free(bnd);
++    free(real.v);
+     return 0;
+ }
+ 
+diff --git a/tools/armrecomp/emit.h b/tools/armrecomp/emit.h
+index 2627904..e20107f 100644
+--- a/tools/armrecomp/emit.h
++++ b/tools/armrecomp/emit.h
+@@ -26,7 +26,11 @@ typedef struct {
+     uint32_t insns;
+     uint32_t translated;   /* emitted as real C            */
+     uint32_t trapped;      /* emitted as a named trap      */
++    uint32_t overlaps;     /* fall-throughs past an overlapping decode (jump table read too far) */
+     uint32_t literals;     /* literal-pool loads folded to constants */
++    uint32_t promoted;     /* off-bound code made a function of its own  */
++    uint32_t neon;         /* NEON instructions handed to the runtime    */
++    uint32_t varrefs;      /* MOVW/MOVT relocated to an imported variable */
+     uint32_t import_calls; /* call sites bound to a firmware import  */
+     uint32_t imports_used; /* distinct imports actually reached      */
+ 
+diff --git a/tools/armrecomp/main.c b/tools/armrecomp/main.c
+index dda0a2e..51a6b89 100644
+--- a/tools/armrecomp/main.c
++++ b/tools/armrecomp/main.c
+@@ -688,6 +688,8 @@ static int cmd_discover(const char *path) {
+     printf("  module_start        %u\n", r.seeds_entry);
+     printf("  exports             %u\n", r.seeds_export);
+     printf("  call targets        %u\n", r.seeds_call);
++    if (r.seeds_movw)
++        printf("  movw/movt addresses %u  (computed, no stored pointer)\n", r.seeds_movw);
+     printf("  pointer shape       %u  (heuristic; %u candidates rejected)\n",
+            r.seeds_shape, r.rejected_shape);
+     printf("    of which in .text %u\n", r.seeds_shape - r.seeds_shape_data);
+@@ -776,7 +778,12 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
+            st.insns ? 100.0 * st.translated / st.insns : 0.0);
+     printf("  trapped       %u  (%.2f%%)\n", st.trapped,
+            st.insns ? 100.0 * st.trapped / st.insns : 0.0);
++    printf("  overlaps      %u  fall-throughs fixed past overlapping decodes\n", st.overlaps);
+     printf("  literals      %u  folded to constants\n", st.literals);
++    printf("  promoted      %u  shared code emitted once as its own function\n", st.promoted);
++    printf("  neon          %u  executed by the runtime from the encoding\n", st.neon);
++    printf("  import vars   %u  variables, %u of %u MOVW/MOVT relocated (%u refs of other kinds)\n",
++           vm.var_count, st.varrefs, vm.varref_count, vm.varref_unhandled);
+     printf("  import calls  %u  bound to firmware\n", st.import_calls);
+     if (st.stub_shadowed)
+         printf("  stubs shadowed %u  discovered as functions, routed as imports\n",
+@@ -828,7 +835,13 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
+     return 0;
+ }
+ 
++uint32_t g_dbg_trace_addr;   /* VITA_DBGA: direcci├│n a rastrear (0 = nada) */
++
+ int main(int argc, char **argv) {
++    {
++        const char *d = getenv("VITA_DBGA");
++        if (d) g_dbg_trace_addr = (uint32_t)strtoul(d, NULL, 16);
++    }
+     if (argc < 2) {
+         fputs(USAGE, stderr);
+         return 2;
+diff --git a/tools/armrecomp/module.c b/tools/armrecomp/module.c
+index 8a02d83..cbfa353 100644
+--- a/tools/armrecomp/module.c
++++ b/tools/armrecomp/module.c
+@@ -22,6 +22,11 @@ static uint32_t r32(const uint8_t *p) {
+          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+ }
+ 
++static int varref_cmp(const void *a, const void *b) {
++    uint32_t x = ((const vm_varref *)a)->addr, y = ((const vm_varref *)b)->addr;
++    return x < y ? -1 : x > y ? 1 : 0;
++}
++
+ static int stub_cmp(const void *a, const void *b) {
+     uint32_t x = ((const vm_stub *)a)->addr, y = ((const vm_stub *)b)->addr;
+     return x < y ? -1 : x > y ? 1 : 0;
+@@ -145,11 +150,15 @@ int vm_parse(const vm_image *img, uint32_t entry, vm_module *out,
+             read_name_va(img, r32(e + 0x14), im->name, sizeof(im->name));
+             im->func_nid_table   = r32(e + 0x1C);
+             im->func_entry_table = r32(e + 0x20);
++            im->var_nid_table    = r32(e + 0x24);
++            im->var_entry_table  = r32(e + 0x28);
+         } else {
+             im->library_nid      = r32(e + 0x0C);
+             read_name_va(img, r32(e + 0x10), im->name, sizeof(im->name));
+             im->func_nid_table   = r32(e + 0x14);
+             im->func_entry_table = r32(e + 0x18);
++            im->var_nid_table    = r32(e + 0x1C);
++            im->var_entry_table  = r32(e + 0x20);
+         }
+ 
+         out->total_func_imports += im->num_funcs;
+@@ -193,6 +202,66 @@ int vm_parse(const vm_image *img, uint32_t entry, vm_module *out,
+         qsort(out->stubs, out->stub_count, sizeof(vm_stub), stub_cmp);
+     }
+ 
++    /* --- imported variables --------------------------------------------- */
++    /*
++     * Each variable's entry points at its reference list: a header word whose
++     * bits 31-8 count the MOVW/MOVT pairs, then two words per reference ΓÇö
++     * relocation type in bits 15-8 (0x2F R_ARM_THM_MOVW_ABS_NC, 0x30
++     * R_ARM_THM_MOVT_ABS) and the instruction's offset from segment 0.
++     */
++    uint32_t nvars = 0, nrefs = 0;
++    for (int i = 0; i < out->import_count; i++) nvars += out->imports[i].num_vars;
++    if (nvars) {
++        out->vars = (vm_var *)calloc(nvars, sizeof(vm_var));
++        if (!out->vars) return fail(err, errsz, "out of memory");
++        for (int pass = 0; pass < 2; pass++) {
++            uint32_t vi = 0, ri = 0;
++            for (int i = 0; i < out->import_count; i++) {
++                const vm_import *im = &out->imports[i];
++                const uint8_t *nt = vm_va(img, im->var_nid_table, (uint32_t)im->num_vars * 4);
++                const uint8_t *et = vm_va(img, im->var_entry_table, (uint32_t)im->num_vars * 4);
++                if (!nt || !et) { vi += im->num_vars; continue; }
++                for (uint32_t k = 0; k < im->num_vars; k++, vi++) {
++                    uint32_t cell = VM_VAR_CELL_BASE + vi * VM_VAR_CELL_SIZE;
++                    if (pass == 0) {
++                        out->vars[vi].lib_nid = im->library_nid;
++                        out->vars[vi].nid = r32(nt + k * 4);
++                        out->vars[vi].cell = cell;
++                    }
++                    uint32_t list = r32(et + k * 4);
++                    const uint8_t *h = vm_va(img, list, 4);
++                    if (!h) continue;
++                    uint32_t n = 2 * (r32(h) >> 8);
++                    const uint8_t *refs = vm_va(img, list + 4, n * 8);
++                    if (!refs) continue;
++                    for (uint32_t j = 0; j < n; j++) {
++                        uint32_t typ = (r32(refs + j * 8) >> 8) & 0xFF;
++                        uint32_t at  = img->seg_vaddr + r32(refs + j * 8 + 4);
++                        if (typ != 0x2F && typ != 0x30) {
++                            if (pass == 0) out->varref_unhandled++;
++                            continue;
++                        }
++                        if (pass == 1) {
++                            out->varrefs[ri].addr = at;
++                            out->varrefs[ri].cell = cell;
++                            out->varrefs[ri].hi = (uint8_t)(typ == 0x30);
++                        }
++                        ri++;
++                    }
++                }
++            }
++            if (pass == 0) {
++                out->var_count = vi;
++                nrefs = ri;
++                out->varrefs = (vm_varref *)calloc(nrefs ? nrefs : 1, sizeof(vm_varref));
++                if (!out->varrefs) return fail(err, errsz, "out of memory");
++            } else {
++                out->varref_count = ri;
++            }
++        }
++        qsort(out->varrefs, out->varref_count, sizeof(vm_varref), varref_cmp);
++    }
++
+     return 0;
+ }
+ 
+@@ -201,6 +270,22 @@ void vm_free(vm_module *m) {
+     free(m->stubs);
+     m->stubs = NULL;
+     m->stub_count = 0;
++    free(m->vars);
++    free(m->varrefs);
++    m->vars = NULL;
++    m->varrefs = NULL;
++    m->var_count = m->varref_count = 0;
++}
++
++const vm_varref *vm_find_varref(const vm_module *m, uint32_t addr) {
++    if (!m || !m->varrefs) return NULL;
++    uint32_t lo = 0, hi = m->varref_count;
++    while (lo < hi) {
++        uint32_t mid = lo + (hi - lo) / 2;
++        if (m->varrefs[mid].addr == addr) return &m->varrefs[mid];
++        if (m->varrefs[mid].addr <  addr) lo = mid + 1; else hi = mid;
++    }
++    return NULL;
+ }
+ 
+ const vm_stub *vm_find_stub(const vm_module *m, uint32_t addr) {
+diff --git a/tools/armrecomp/module.h b/tools/armrecomp/module.h
+index 04570d4..dbf4df4 100644
+--- a/tools/armrecomp/module.h
++++ b/tools/armrecomp/module.h
+@@ -76,8 +76,35 @@ typedef struct {
+     uint16_t num_vars;
+     uint32_t func_nid_table;    /* segment-relative */
+     uint32_t func_entry_table;
++    uint32_t var_nid_table;     /* absolute */
++    uint32_t var_entry_table;   /* each entry: that variable's reference list */
+ } vm_import;
+ 
++/* An imported VARIABLE (SceLibc's _Ctype, _Stdout, __stack_chk_guard...).
++ *
++ * Firmware data is not called, it is addressed: the loader writes the
++ * variable's address into every MOVW/MOVT pair the module uses to reach it.
++ * The recompiler has turned those immediates into constants, so it does the
++ * loader's job here instead: each variable gets a CELL in guest memory, every
++ * referencing MOVW/MOVT is emitted with the cell's address, and the host fills
++ * the cell. Left unresolved, the pairs keep the linker's placeholder and the
++ * module reads whatever bytes are there ΓÇö which is how a path came out as
++ * "CONF$G_r$$N.TXT": toupper through a table that was never there. */
++#define VM_VAR_CELL_BASE 0x82080000u   /* after the ELF, before the libc heap */
++#define VM_VAR_CELL_SIZE 32u
++
++typedef struct {
++    uint32_t lib_nid;
++    uint32_t nid;
++    uint32_t cell;
++} vm_var;
++
++typedef struct {
++    uint32_t addr;        /* the MOVW or MOVT instruction */
++    uint32_t cell;
++    uint8_t  hi;          /* 1 = MOVT */
++} vm_varref;
++
+ /* One imported function, at the address the module actually calls.
+  *
+  * A module never calls firmware directly. It calls a STUB inside its own .text,
+@@ -104,6 +131,12 @@ typedef struct {
+ 
+     vm_stub       *stubs;              /* sorted by addr; free with vm_free() */
+     uint32_t       stub_count;
++
++    vm_var        *vars;               /* imported variables, one cell each */
++    uint32_t       var_count;
++    vm_varref     *varrefs;            /* sorted by addr */
++    uint32_t       varref_count;
++    uint32_t       varref_unhandled;   /* reference kinds not translated */
+ } vm_module;
+ 
+ void vm_free(vm_module *m);
+@@ -111,6 +144,9 @@ void vm_free(vm_module *m);
+ /* Look up a call target. Returns NULL when the address is not an import stub. */
+ const vm_stub *vm_find_stub(const vm_module *m, uint32_t addr);
+ 
++/* The variable reference at this instruction, or NULL. */
++const vm_varref *vm_find_varref(const vm_module *m, uint32_t addr);
++
+ /* Parse the module info at `entry` (the raw e_entry value; the segment index in
+  * its top two bits is honoured). Returns 0 on success. */
+ int vm_parse(const vm_image *img, uint32_t entry, vm_module *out,

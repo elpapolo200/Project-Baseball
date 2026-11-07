@@ -1,0 +1,123 @@
+Project Baseball - port nativo de MLB 15 The Show (PS Vita) para PC
+===================================================================
+
+Este programa ejecuta MLB 15 The Show (PS Vita, PCSA00511) de forma nativa en
+Windows. No incluye nada del juego: usa TU copia instalada en Vita3K. Vita3K no
+se ejecuta; solo se leen sus archivos.
+
+Antes de la primera vez
+-----------------------
+1. Ten el juego instalado en Vita3K.
+2. En Vita3K, clic derecho sobre MLB 15 The Show -> "Decrypt All SELF"
+   (solo una vez). Crea cache\decrypted_selfs\PCSA00511\eboot.bin dentro de la
+   carpeta de Vita3K.
+
+Primer arranque
+---------------
+(Si es la primera vez con esta versión del port, después de elegir la carpeta y el
+eboot sale "Preparando MLB 15 para tu PC": se traduce y compila el juego a partir
+de tu copia en datos\juego.dll. Tarda unos minutos y solo pasa una vez. Necesita
+la carpeta herramientas junto a ProjectBaseball.exe.)
+
+Abre ProjectBaseball.exe y elige:
+1. la carpeta del juego, PCSA00511 (la que contiene VITA_COMPRESSED_WAD.arc;
+   con Vita3K: ...\Vita3K\ux0\app\PCSA00511);
+2. si su eboot.bin está cifrado (lo normal), el eboot.bin DESCIFRADO: con
+   Vita3K está en <carpeta de Vita3K>\cache\decrypted_selfs\PCSA00511\eboot.bin.
+Se guarda en ProjectBaseball.ini y la próxima vez arranca directamente.
+
+**Llevarlo a otro PC**: copia la carpeta MLB15_Port entera (la carpeta texturas es
+opcional, ocupa mucho). Con datos\eboot.elf y datos\juego.dll ya preparados no hace
+falta el eboot.bin: solo elige la carpeta del juego de ese PC (Shift al abrir). Sin
+Vita3K también vale el eboot.bin o eboot.elf descifrado con FAGDec en una PS Vita con
+homebrew.
+
+**Cambiar la carpeta del juego**: mantén **Shift** al hacer doble clic en ProjectBaseball.exe
+para volver a seleccionar la carpeta y el eboot.
+
+Opciones gráficas
+-----------------
+Al abrir ProjectBaseball.exe sale la ventana de opciones: resolución interna (x1 a x4),
+ventana o pantalla completa, tamaño de la ventana, límite de FPS (30 para
+ahorrar energía o batería, 60 recomendado), brillo, nitidez, suavizado, mostrar
+los FPS, texturas mejoradas y jugadores en máxima calidad. "Jugar" guarda y
+arranca. Si desmarcas "Mostrar esta ventana al arrancar", mantén **Ctrl** al
+abrir ProjectBaseball.exe para volver a verla.
+"Controles..." permite cambiar la tecla de cada botón de la Vita (se guarda en
+ProjectBaseball.ini, sección [controles]; el mando de Xbox usa siempre su distribución).
+"Sombras de los jugadores" (activada) da a los jugadores el sombreado de la Vita.
+
+Controles
+---------
+  Flechas ........... cruceta          X / Espacio ...... Cruz (aceptar)
+  C ................. Círculo (atrás)  Z / V ............ Cuadrado / Triángulo
+  Q / E ............. L / R            Enter / Shift dcho. Start / Select
+  WASD / IJKL ....... sticks           Mando (Xbox/SDL) . A Cruz, B Círculo...
+  Ratón ............. pantalla táctil (clic = tocar, arrastrar = deslizar)
+  Alt+Enter o F11 ... pantalla completa
+  F10 ............... muestra / oculta los FPS (arriba a la izquierda)
+  F9 ................ cambia la resolución interna x1 → x2 → x3 → x4 (se aplica al reiniciar)
+  F12 ............... si el juego se congela: guarda el estado en watchdog.txt
+  Esc ............... sale de pantalla completa; en ventana, cierra el juego
+
+**Portada (pantalla con el jugador de los Dodgers y la pestaña «SWIPE»)**: pulsa
+**Start** (Enter en el teclado, o Start/Menú en el mando) para entrar al menú principal.
+Ahí la Cruz no hace nada.
+
+**Mapeo de teclas personalizado**: edita ProjectBaseball.ini, sección `[teclas]`.
+Ejemplo:
+  [teclas]
+  x = cruz
+  espacio = cruz
+  c = circulo
+  z = cuadrado
+  v = triangulo
+  q = l
+  e = r
+  enter = start
+  shift_dcho = select
+  w = stick_izq_arriba
+  s = stick_izq_abajo
+  a = stick_izq_izquierda
+  d = stick_izq_derecha
+  i = stick_der_arriba
+  k = stick_der_abajo
+  j = stick_der_izquierda
+  l = stick_der_derecha
+
+ProjectBaseball.ini
+---------
+  [juego]       carpeta = carpeta del juego    eboot = eboot.bin descifrado
+  [video]       escala = 0 (automática: 85 % de la pantalla; 1, 2... = ventana de 960x544 x escala)   pantalla_completa = 0/1
+                resolucion = 3 (nitidez: el juego se dibuja a x3; 2 si va lento con batería, 1 = como la Vita)
+                jugadores_alta = 1 (todos los jugadores con el modelo de máxima calidad; 0 = como en la Vita)
+                texturas_hd = 1 (usa las texturas mejoradas de la carpeta texturas\ si existen; 0 = las originales)
+                mostrar_fps = 0/1 (F10)
+                sombra_jugadores = 1 (sombras de los jugadores sobre sí mismos)
+                fps_max = 60 (30 = ahorro de energía)   mostrar_opciones = 1 (ventana de opciones al arrancar)
+                brillo = 85 (% del brillo del juego; 100 = igual que en Vita3K, menos = deslumbra menos)
+                suavizado = 1 (quita los dientes de sierra de los bordes; 0 = apagado)
+                nitidez = 35 (0-100: realce de detalle al escalar a la ventana)
+                posproceso = 1 (0 = sin suavizado ni nitidez, escalado simple como antes)
+  [depuracion]  consola = 1 para ver el registro en una consola
+  [teclas]      (ver arriba; si falta una, se usa el valor por defecto)
+
+Archivos que crea: datos\eboot.elf (el ejecutable del juego listo para el port),
+datos\log.txt (registro) y las partidas guardadas en datos\.
+Si el juego se cierra por error, se crea crash.txt junto al exe.
+
+Estado: menú, Play Now y partidos completos con sonido y gráficos de la Vita.
+Guarda los ajustes y las partidas en datos\ (borra esa carpeta para empezar de cero,
+salvo eboot.elf). Modos distintos de Play Now: sin probar.
+
+Pantalla negra o muy lento (portátiles con gráficos integrados Intel/AMD)
+-----------------------------------------------------------------------
+- El port necesita Vulkan: actualiza el driver de la tarjeta desde la web de
+  Intel/AMD/NVIDIA (con Intel, el "Intel Driver & Support Assistant"). Si no hay
+  Vulkan, el lanzador avisa al abrir.
+- Con solo gráficos integrados el lanzador empieza en resolución x1 y 30 FPS.
+  Si aún va lento, quita el suavizado y las texturas HD. x2-x4 son para
+  tarjetas dedicadas.
+- Con dos tarjetas, ProjectBaseball.ini [video] tarjeta=0/1 elige cuál usar.
+
+

@@ -103,6 +103,26 @@ void gpu_draw_v3k(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t ui
                   uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data, const void *fdata, uint32_t fbytes_data,
                   const float viewport[4], const GpuTexture *const tex[16]);
 
+/* Vértices «crudos» (PLAN_RENDIMIENTO.md fase 4): en vez de convertir cada vértice a vec4 float
+ * en la CPU, se copian los bytes del juego tal cual (solo los vértices que usa el dibujo) y la
+ * GPU los convierte al leerlos con el formato de cada atributo. Binding nbind = valor por
+ * defecto (0,0,0,1) para las locations que ningún atributo escribe. */
+#define GPU_VLAY_MAXB 8
+typedef struct {
+    uint8_t  nloc, nbind;
+    uint8_t  loc_bind[16];          /* 0xFF = valor por defecto */
+    uint8_t  loc_fmt[16];           /* formato GXM << 4 | componentes */
+    uint16_t loc_off[16];
+    uint16_t stride[GPU_VLAY_MAXB];
+    uint8_t  inst[GPU_VLAY_MAXB];   /* 1 = por instancia */
+} GpuVLayout;
+int gpu_vfmt_ok(uint8_t gxm_fmt, uint8_t comps);   /* la tarjeta lee ese formato directamente */
+void gpu_draw_v3k_crudo(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, const GpuVLayout *lay,
+                        const uint8_t *const bdata[GPU_VLAY_MAXB], const uint32_t bbytes[GPU_VLAY_MAXB], uint32_t ninst,
+                        uint32_t nv, const uint32_t *idx, uint32_t ni, const void *vinfo, uint32_t vinfo_bytes,
+                        const void *finfo, uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data,
+                        const void *fdata, uint32_t fbytes_data, const float viewport[4], const GpuTexture *const tex[16]);
+
 /* Ventana SDL con swapchain Vulkan (no se abre con MLB15_NOWINDOW=1).
  * gpu_present copia a la ventana la superficie que el juego presenta: la
  * imagen que ya dibujó Vulkan, o su memoria guest si no la dibujó la GPU. */

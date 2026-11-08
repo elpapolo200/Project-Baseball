@@ -138,6 +138,23 @@ static void sin_modo_eficiencia(void) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof(s));
 }
 
+/* Prioridad del proceso (2026-11-08). Con OBS u otro programa que ocupe la CPU el juego caía
+ * de 60 a ~20 FPS: sus hilos se pasan el trabajo esperando por turnos y, a prioridad normal,
+ * cada espera regala el núcleo a otro programa. Medido con 10 procesos quemando CPU (ventana
+ * oculta, x3): 14 FPS a prioridad normal, 58,5 «por encima de lo normal». Desactivado por
+ * defecto; se activa con [sistema] prioridad=1 (2 = alta) o MLB15_PRIORIDAD=n. Se aplica
+ * después de preparar juego.dll: la compilación sigue a prioridad normal. */
+static void prioridad_juego(void) {
+    extern void arranque(const char *fmt, ...);
+    const char *e = getenv("MLB15_PRIORIDAD");
+    int nivel = e ? atoi(e) : launcher_ini_int("sistema", "prioridad", 0);
+    if (nivel <= 0) return;
+    SetPriorityClass(GetCurrentProcess(), nivel == 1 ? ABOVE_NORMAL_PRIORITY_CLASS : HIGH_PRIORITY_CLASS);
+    const char *nom = nivel == 1 ? "por encima de lo normal" : "alta";
+    printf("[sistema] prioridad %s\n", nom);
+    arranque("sistema: prioridad %s", nom);
+}
+
 int main(int argc, char **argv) {
     sin_modo_eficiencia();
     /* Con un ELF en la línea de órdenes (desarrollo) se usa ese; si no, el
@@ -170,6 +187,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    prioridad_juego();
     vita_load_info info;
     if (vita_probe_elf(elf, &info) != 0) {
         fprintf(stderr, "no se pudo leer %s\n", elf);
@@ -180,6 +198,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no se pudo reservar la memoria de la guest\n");
         return 1;
     }
+    juego_memoria();
     if (vita_load_elf(elf, &info) != 0) {
         fprintf(stderr, "no se pudo cargar %s\n", elf);
         return 1;

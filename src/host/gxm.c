@@ -2262,6 +2262,103 @@ static double dv3k_now(void) {
     if (inv == 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); inv = 1.0 / (double)f.QuadPart; }
     LARGE_INTEGER q; QueryPerformanceCounter(&q); return (double)q.QuadPart * inv;
 }
+/* --- vértices crudos (PLAN_RENDIMIENTO.md fase 4) -----------------------------------------
+ * Antes cada vértice de cada dibujo se convertía aquí a vec4 float (g_rverts) y se subía: ~15-20 %
+ * de un núcleo en el hilo de dibujo. Ahora se copian los bytes del juego (solo los vértices que usa
+ * el dibujo, en el orden de g_vsrc) y la GPU los convierte con el formato de cada atributo.
+ * Devuelve 0 (y se usa el camino viejo) si algo no encaja: formato que la tarjeta no lee,
+ * atributo desalineado, regformat, más de 4 componentes... MLB15_VERTICES_CPU=1: siempre el viejo. */
+static uint8_t *g_cbuf[GPU_VLAY_MAXB];
+static uint32_t g_ccap[GPU_VLAY_MAXB];
+static unsigned long g_crudo_si, g_crudo_no, g_crudo_por[24];
+static int crudo_permitido(void) {
+    static int ok = -1;
+    if (ok < 0) ok = !(env_cached("MLB15_VERTICES_CPU") || env_cached("MLB15_TRAZA_FGXP") || env_cached("MLB15_TRAZA_ROJO") ||
+                       env_cached("MLB15_ESCENA_VERTICES") || env_cached("MLB15_VFMT_TRAZA"));
+    return ok;
+}
+/* Devuelve 1 (vértices en el orden de g_vsrc), 2 (rango seguido [*lo..maxsrc] copiado de una vez:
+ * los índices se renumeran a original - *lo) o 0 (camino viejo). */
+static int prepara_crudo(const VProg *v, const V3kInfo *vi, const uint32_t streams[16], uint32_t nloc, uint32_t nvb,
+                         uint32_t ninst, uint32_t maxsrc, GpuVLayout *lay, const uint8_t **bdata, uint32_t *bbytes,
+                         uint32_t *lo_out) {
+    memset(lay, 0, sizeof(*lay));
+    lay->nloc = (uint8_t)nloc;
+    memset(lay->loc_bind, 0xFF, sizeof(lay->loc_bind));
+    int smap[16];
+    uint8_t bstream[GPU_VLAY_MAXB];
+    uint32_t need[GPU_VLAY_MAXB] = { 0 };
+    for (int i = 0; i < 16; i++) smap[i] = -1;
+    for (uint32_t k = 0; k < vi->nattr; k++) {
+        const V3kAttr *va = &vi->attr[k];
+        if (va->semantic || va->loc >= nloc) continue;
+        const Attr *a = NULL;
+        for (int q = 0; q < v->nattr; q++) if (v->attr[q].reg == va->reg) { a = &v->attr[q]; break; }
+        if (!a || a->stream >= 16 || !streams[a->stream]) continue;
+        if (va->regformat) { g_crudo_por[1]++; return 0; }
+        uint32_t nl = va->loc + va->nloc > nloc ? nloc - va->loc : va->nloc;
+        int comps = a->comps < va->comps ? a->comps : va->comps;
+        if (comps > (int)nl * 4) comps = (int)nl * 4;
+        if (comps < 1 || comps > 4 || a->format > 9 || !gpu_vfmt_ok(a->format, (uint8_t)comps)) { g_crudo_por[2]++; return 0; }
+        uint32_t stride = v->stride[a->stream], cs = comp_size(a->format);
+        if (a->offset % cs || stride % cs || stride > 2048 || a->offset > 2047) { g_crudo_por[3]++; return 0; }
+        int per_inst = (v->index_source[a->stream] & 2) != 0;
+        uint32_t nsrc = per_inst ? ninst : maxsrc + 1;
+        if (!vita_mem_ptr(streams[a->stream] + a->offset, (nsrc - 1) * stride + cs * (uint32_t)comps)) continue;   /* como antes: valor por defecto */
+        int b = smap[a->stream];
+        if (b < 0) {
+            if (lay->nbind >= GPU_VLAY_MAXB) { g_crudo_por[4]++; return 0; }
+            b = smap[a->stream] = lay->nbind++;
+            lay->stride[b] = (uint16_t)stride; lay->inst[b] = (uint8_t)per_inst; bstream[b] = (uint8_t)a->stream;
+        }
+        uint32_t end = a->offset + cs * (uint32_t)comps;
+        if (end > need[b]) need[b] = end;
+        if (lay->loc_bind[va->loc] != 0xFF) { g_crudo_por[5]++; return 0; }   /* dos atributos en la misma location */
+        lay->loc_bind[va->loc] = (uint8_t)b;
+        lay->loc_off[va->loc] = a->offset;
+        lay->loc_fmt[va->loc] = (uint8_t)(a->format << 4 | comps);
+    }
+    /* Rango seguido: casi siempre los vértices de un trozo están juntos en el buffer del juego.
+     * Si el hueco es pequeño se copia [lo..maxsrc] de una vez (una llamada por flujo en vez de una
+     * por vértice). */
+    uint32_t lo = maxsrc;
+    for (uint32_t i = 0; i < nvb; i++) if (g_vsrc[i] < lo) lo = g_vsrc[i];
+    uint32_t span = maxsrc - lo + 1;
+    int rango = span <= nvb + nvb / 2 + 16;
+    *lo_out = lo;
+    for (uint32_t b = 0; b < lay->nbind; b++) {
+        uint32_t stride = lay->stride[b], n = !stride ? 1 : lay->inst[b] ? ninst : rango ? span : nvb;
+        if (stride && stride < need[b]) { g_crudo_por[6]++; return 0; }
+        uint32_t rec = stride ? stride : need[b], bytes = n * rec;
+        if (bytes > g_ccap[b]) {
+            uint32_t cap = bytes < 65536 ? 65536 : bytes * 2;
+            uint8_t *nb = (uint8_t *)realloc(g_cbuf[b], cap);
+            if (!nb) { g_crudo_por[7]++; return 0; }
+            g_cbuf[b] = nb; g_ccap[b] = cap;
+        }
+        uint32_t last = !stride ? 0 : lay->inst[b] ? ninst - 1 : maxsrc;
+        const uint8_t *base = (const uint8_t *)vita_mem_ptr(streams[bstream[b]], last * stride + need[b]);
+        if (!base) { g_crudo_por[8]++; return 0; }
+        uint8_t *dst = g_cbuf[b];
+        if (!stride) memcpy(dst, base, need[b]);
+        else if (lay->inst[b]) memcpy(dst, base, (size_t)(ninst - 1) * stride + need[b]);
+        else if (rango) memcpy(dst, base + (size_t)lo * stride, (size_t)(span - 1) * stride + need[b]);
+        else if (!(need[b] & 3)) {   /* disperso: copia por palabras, sin una llamada por vértice */
+            uint32_t w = need[b] >> 2;
+            for (uint32_t i = 0; i < nvb; i++) {
+                const uint8_t *src = base + (size_t)g_vsrc[i] * stride;
+                uint8_t *d = dst + (size_t)i * stride;
+                for (uint32_t k = 0; k < w; k++) { uint32_t x; memcpy(&x, src + 4 * k, 4); memcpy(d + 4 * k, &x, 4); }
+            }
+        } else {
+            uint32_t m = need[b];
+            for (uint32_t i = 0; i < nvb; i++) memcpy(dst + (size_t)i * stride, base + (size_t)g_vsrc[i] * stride, m);
+        }
+        bdata[b] = dst; bbytes[b] = bytes;
+    }
+    return rango ? 2 : 1;
+}
+
 static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[16], uint32_t ptype, uint32_t icount,
                      uint32_t nvb, uint32_t ninst, uint32_t maxsrc) {
     {   /* MLB15_V3K_SALTA=lista de fgxp (hex): no dibujar esos programas (aislar fallos) */
@@ -2306,9 +2403,24 @@ static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[
     uint32_t nloc = vi->nloc ? (vi->nloc > 16 ? 16 : vi->nloc) : 1, nv = nvb * ninst, uint_mask = 0;
     if (!g_rverts) g_rverts = (float *)malloc((size_t)MAX_DRAW_VERTS * 16 * 4 * sizeof(float));
     if (!g_rverts) return;
+    GpuVLayout clay;
+    const uint8_t *cdata[GPU_VLAY_MAXB];
+    uint32_t cbytes[GPU_VLAY_MAXB];
+    uint32_t crudo_lo = 0;
+    int crudo = crudo_permitido() && !rec_on() && !scene_dump() ?
+                prepara_crudo(v, vi, streams, nloc, nvb, ninst, maxsrc, &clay, cdata, cbytes, &crudo_lo) : 0;
+    if (crudo == 2)   /* rango seguido: índices = original - lo (g_idx tenía la posición en g_vsrc) */
+        for (uint32_t i = 0; i < icount; i++) g_idx[i] = g_vsrc[g_idx[i]] - crudo_lo;
+    if (crudo) g_crudo_si++; else g_crudo_no++;
+    if ((g_crudo_si + g_crudo_no) % 300000 == 0) {   /* cuántos dibujos van por el camino nuevo y por qué no los demás */
+        printf("[crudo] %lu crudos, %lu por el camino viejo (permitido %d) motivos:", g_crudo_si, g_crudo_no, crudo_permitido());
+        for (int k = 1; k < 24; k++) if (g_crudo_por[k]) printf(" %d=%lu", k, g_crudo_por[k]);
+        printf("\n");
+    }
     /* Valores por defecto (0,0,0,1) solo en las locations que ningún atributo escribe entero:
      * antes se rellenaba todo (nv x nloc vec4) y luego se sobrescribía, ~1 200 draws por
      * fotograma. Las de formato registro se ponen a 0 en el bucle de abajo. */
+    if (!crudo) {   /* camino viejo: vec4 float por location en g_rverts */
     uint32_t llenas = 0;
     {
         static int todo = -1;
@@ -2355,6 +2467,21 @@ static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[
                 }
         }
         uint32_t stride = v->stride[a->stream], cs = comp_size(a->format);
+        {   /* MLB15_VFMT_TRAZA=1: qué formatos de vértice usa el juego (fase 4 del plan de rendimiento) */
+            static int on = -1;
+            if (on < 0) on = env_cached("MLB15_VFMT_TRAZA") ? 1 : 0;
+            if (on) {
+                static unsigned hist[16][17][2], tot, al_mal;
+                hist[a->format & 15][comps > 16 ? 16 : comps][va->regformat ? 1 : 0]++;
+                if (((streams[a->stream] + a->offset) | stride) % cs) al_mal++;
+                if (++tot % 200000 == 0) {
+                    printf("[vfmt] %u atributos (desalineados %u):", tot, al_mal);
+                    for (int fm = 0; fm < 16; fm++) for (int cc = 0; cc < 17; cc++) for (int rg = 0; rg < 2; rg++)
+                        if (hist[fm][cc][rg]) printf(" f%d c%d%s=%u", fm, cc, rg ? "r" : "", hist[fm][cc][rg]);
+                    printf("\n");
+                }
+            }
+        }
         int per_inst = (v->index_source[a->stream] & 2) != 0;
         uint32_t nsrc = per_inst ? ninst : maxsrc + 1;
         const uint8_t *base = (const uint8_t *)vita_mem_ptr(streams[a->stream] + a->offset, (nsrc - 1) * stride + cs * (uint32_t)comps);
@@ -2401,6 +2528,7 @@ static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[
 #undef DEC_LOOP
         }
     }
+    }   /* fin del camino viejo */
     {   /* MLB15_TRAZA_FGXP=hex: rango de cada location y buffers del vértice */
         static uint32_t want = 1;
         static int n;
@@ -2446,7 +2574,7 @@ static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[
         }
     }
     double cr1 = dv3k_now(); g_dv3k_t[0] += cr1 - cr0;
-    uint32_t nt = build_tris(ptype, icount, nvb, ninst);
+    uint32_t nt = build_tris(ptype, icount, nvb, crudo ? 1 : ninst);   /* crudo: instancias de verdad (vkCmdDrawIndexed) */
     GpuDraw d;
     memset(&d, 0, sizeof(d));
     draw_state(c, f, &d);
@@ -2788,8 +2916,12 @@ static void draw_v3k(Ctx *c, VProg *v, FProg *f, int fv, const uint32_t streams[
     extern void gpu_ub_tarde(uint32_t guest, uint32_t bytes, uint32_t mb_off);
     uint32_t prev_off = gpu_last_fdata_off();
     double cr4 = dv3k_now(); g_dv3k_t[3] += cr4 - cr3;
-    gpu_draw_v3k(&d, v->v3k_mod, fmod_v3k, nloc, uint_mask, g_rverts, nv, g_tri, nt, vinfo, sizeof(vinfo), finfo,
-                 sizeof(finfo), g_v3k_data[0], vb, g_v3k_data[1], fb, viewport, tp);
+    if (crudo)
+        gpu_draw_v3k_crudo(&d, v->v3k_mod, fmod_v3k, nloc, &clay, cdata, cbytes, ninst, nvb, g_tri, nt, vinfo, sizeof(vinfo),
+                           finfo, sizeof(finfo), g_v3k_data[0], vb, g_v3k_data[1], fb, viewport, tp);
+    else
+        gpu_draw_v3k(&d, v->v3k_mod, fmod_v3k, nloc, uint_mask, g_rverts, nv, g_tri, nt, vinfo, sizeof(vinfo), finfo,
+                     sizeof(finfo), g_v3k_data[0], vb, g_v3k_data[1], fb, viewport, tp);
     g_dv3k_t[4] += dv3k_now() - cr4; g_dv3k_t[5] += 1.0; g_dv3k_t[6] += nv;
     {   /* MLB15_UB_TARDE=0 lo desactiva */
         static int tarde = -1;

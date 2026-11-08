@@ -32,6 +32,18 @@ const tls_dir _tls_used = {
     (uint64_t)&_tls_start, (uint64_t)&_tls_end, (uint64_t)&_tls_index, (uint64_t)(&__xl_a + 1), 0, 0
 };
 
+/* --- memoria de la Vita en línea (mem.h, VITA_MEM_DIRECTA; PLAN_RENDIMIENTO.md fase 1) ---
+ * El ejecutable llama a vita_mem_directa justo después de cargar el DLL con la ventana plana
+ * (mem, base, tamaño). Mientras vita_md_lim sea 0 todo acceso va por las funciones del exe. */
+uintptr_t vita_md_off;
+uint32_t  vita_md_base;
+uint32_t  vita_md_lim;
+__declspec(dllexport) void vita_mem_directa(unsigned char *mem, uint32_t base, unsigned long long size) {
+    vita_md_off = (uintptr_t)mem - base;
+    vita_md_base = base;
+    vita_md_lim = size > 3 ? (uint32_t)(size - 3) : 0;
+}
+
 /* clang lo pide en cuanto hay coma flotante (convención de MSVC). */
 int _fltused = 0x9875;
 

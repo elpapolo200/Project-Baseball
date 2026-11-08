@@ -21,6 +21,7 @@ Vulkan y SDL2.
 - Guardado y carga de partidas con una lista propia (Franquicia, Carrera...).
 - Texturas HD opcionales, generadas con Real-ESRGAN a partir de tu copia.
 - Lanzador con ventana de opciones, comprobación de Vulkan y avisos claros.
+- Ligero: desde la v0.2.0 gasta ~20 % menos CPU que la v0.1.0 (ver [`docs/PLAN_RENDIMIENTO.md`](docs/PLAN_RENDIMIENTO.md)).
 
 ## Cómo se usa (versión ya compilada)
 

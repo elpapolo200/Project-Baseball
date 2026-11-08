@@ -75,10 +75,12 @@ if (-not (Test-Path $v3klib) -or $v3knew) {
     if ($LASTEXITCODE -ne 0) { $out | Select-String ' error ' | Select-Object -First 15 | ForEach-Object { Write-Host $_ }; throw 'falló v3k.lib' }
 }
 
+# /GL + /LTCG (2026-11-08, PLAN_RENDIMIENTO.md fase 1): el enlazador puede meter en línea vita_read32 & co.
+# (runtime) en el código del port (gxm.c, gpu_vk.c...) en vez de una llamada por acceso.
 Push-Location (Join-Path $root 'host')
 $glinc = Join-Path $deps 'glslang\include'
 $gllib = Join-Path $deps 'glslang\lib'
-Invoke-VS "cl /nologo /c /O2 /MD /W3 /DVITA_CPU_REMOTA /I`"$inc`" /I`"$vkinc`" /I`"$sdlinc`" /I`"$glinc`" /I`"$at9src`" /Ishaders *.c" | Out-Null
+Invoke-VS "cl /nologo /c /O2 /GL /MD /W3 /DVITA_CPU_REMOTA /I`"$inc`" /I`"$vkinc`" /I`"$sdlinc`" /I`"$glinc`" /I`"$at9src`" /Ishaders *.c" | Out-Null
 Pop-Location
 
 # Runtime de vitarecomp con los registros en juego.dll (cpu.h, VITA_CPU_REMOTA): se compila aquí en vez de
@@ -87,13 +89,13 @@ $rtsrc = Join-Path $root '..\..\vitarecomp\src'
 $rtobj = Join-Path $root 'host\rt'
 New-Item -ItemType Directory -Force $rtobj | Out-Null
 Push-Location $rtobj
-Invoke-VS "cl /nologo /c /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DVITA_CPU_REMOTA /I`"$inc`" `"$rtsrc\*.c`"" | Out-Null
+Invoke-VS "cl /nologo /c /O2 /GL /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DVITA_CPU_REMOTA /I`"$inc`" `"$rtsrc\*.c`"" | Out-Null
 Pop-Location
 
 Push-Location $root
 # Reintento: tras matar una ejecución, Windows tarda un momento en soltar el .exe (1,2 GB).
 for ($n = 1; ; $n++) {
-    try { Invoke-VS "link /nologo /OUT:mlb15_recomp.exe /MAP:mlb15_recomp.map /STACK:16777216 /DEF:dist\exports.def host\*.obj host\rt\*.obj host\mlb15.res hle_defaults.lib `"$at9lib`" `"$v3klib`" `"$sdllib\SDL2.lib`" `"$gllib\glslang.lib`" `"$gllib\glslang-default-resource-limits.lib`" `"$gllib\SPIRV.lib`" `"$gllib\MachineIndependent.lib`" `"$gllib\GenericCodeGen.lib`" `"$gllib\OSDependent.lib`" `"$gllib\SPIRV-Tools-opt.lib`" `"$gllib\SPIRV-Tools.lib`" shell32.lib ole32.lib user32.lib comdlg32.lib" | Out-Null; break }
+    try { Invoke-VS "link /nologo /LTCG /OUT:mlb15_recomp.exe /MAP:mlb15_recomp.map /STACK:16777216 /DEF:dist\exports.def host\*.obj host\rt\*.obj host\mlb15.res hle_defaults.lib `"$at9lib`" `"$v3klib`" `"$sdllib\SDL2.lib`" `"$gllib\glslang.lib`" `"$gllib\glslang-default-resource-limits.lib`" `"$gllib\SPIRV.lib`" `"$gllib\MachineIndependent.lib`" `"$gllib\GenericCodeGen.lib`" `"$gllib\OSDependent.lib`" `"$gllib\SPIRV-Tools-opt.lib`" `"$gllib\SPIRV-Tools.lib`" shell32.lib ole32.lib user32.lib comdlg32.lib" | Out-Null; break }
     catch { if ($n -ge 4) { throw }; Start-Sleep -Seconds 3 }
 }
 try { Copy-Item (Join-Path $sdllib 'SDL2.dll') (Join-Path $root 'SDL2.dll') -Force } catch { Write-Host 'SDL2.dll en uso: se deja la que hay' }

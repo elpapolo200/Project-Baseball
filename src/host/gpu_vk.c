@@ -135,6 +135,7 @@ typedef struct {
     int busy;
     Target *tgt;
     VkCommandBuffer ucmd; Buffer up; uint32_t up_off; int u_open;   /* subidas de texturas de la escena */
+    VkDescriptorSet dset0;                                          /* uniformes v3k con offsets dinámicos */
 } GCtx;
 
 typedef struct Texture_ {
@@ -142,6 +143,8 @@ typedef struct Texture_ {
     uint32_t hash, levels;
     uint32_t iw, ih;                        /* tamaño de la imagen (mayor si es una textura mejorada) */
     uint32_t scene;                         /* escena en la que se comprobó el contenido */
+    uint32_t ww_gen;                        /* generación de escrituras cuando se comprobó (0 = nunca) */
+    uint32_t ww_frame;                      /* fotograma en el que Windows ya dijo que estaba limpia */
     int next;                               /* cadena de la tabla g_tex_bucket (índice+1) */
     VkImage img; VkDeviceMemory mem; VkImageView view;
     VkDescriptorSet set[MAX_SAMPLERS];
@@ -157,11 +160,51 @@ typedef struct {
     uint8_t v3k;                            /* shaders de Vita3K (layout de 4 conjuntos) */
     uint16_t uint_mask;                     /* locations uvec4 (atributos regformat) */
     uint8_t tf;                             /* formato de la superficie (pasada compatible) */
+    uint16_t vlay;                          /* disposición de vértices crudos (0 = vec4 float seguidos) */
 } PipeKey;
+
+/* --- vértices crudos (fase 4 del plan de rendimiento) --- */
+#define MAX_VLAYS 2048
+static GpuVLayout g_vlays[MAX_VLAYS];
+static uint16_t g_vlay_hash[4096];
+static unsigned g_nvlays;
+static int g_vb_crudo;                      /* la escena tiene otros buffers en los bindings: reponer el 0 */
+static Buffer g_vdef;                       /* (0,0,0,1) para las locations sin atributo */
+static uint16_t vlay_id(const GpuVLayout *l) {
+    uint32_t h = 2166136261u;
+    const uint8_t *p = (const uint8_t *)l;
+    for (size_t i = 0; i < sizeof(*l); i++) h = (h ^ p[i]) * 16777619u;
+    for (uint32_t s = h & 4095;; s = (s + 1) & 4095) {
+        if (!g_vlay_hash[s]) {
+            if (g_nvlays >= MAX_VLAYS) return 0;
+            g_vlays[g_nvlays] = *l;
+            g_vlay_hash[s] = (uint16_t)++g_nvlays;
+            return (uint16_t)g_nvlays;
+        }
+        if (!memcmp(&g_vlays[g_vlay_hash[s] - 1], l, sizeof(*l))) return g_vlay_hash[s];
+    }
+}
+static VkFormat vfmt_vk(uint8_t f, uint8_t c) {
+    static const VkFormat t[10][4] = {
+        { VK_FORMAT_R8_USCALED, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8B8_USCALED, VK_FORMAT_R8G8B8A8_USCALED },
+        { VK_FORMAT_R8_SSCALED, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8B8_SSCALED, VK_FORMAT_R8G8B8A8_SSCALED },
+        { VK_FORMAT_R16_USCALED, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16B16_USCALED, VK_FORMAT_R16G16B16A16_USCALED },
+        { VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED, VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16A16_SSCALED },
+        { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM },
+        { VK_FORMAT_R8_SNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8B8_SNORM, VK_FORMAT_R8G8B8A8_SNORM },
+        { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16A16_UNORM },
+        { VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM },
+        { VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16B16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT },
+        { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT } };
+    return f < 10 && c >= 1 && c <= 4 ? t[f][c - 1] : VK_FORMAT_UNDEFINED;
+}
+
 typedef struct { PipeKey key; VkPipeline pipe; } Pipe;
 typedef struct { uint32_t key; VkSampler s; } Sampler;
 
 static int g_tried, g_ok;
+static DWORD g_win_hilo;   /* hilo que creó la ventana SDL (solo él recibe sus mensajes) */
+static volatile int g_win_propio;   /* la ventana tiene su hilo (ventana_hilo) */
 
 /* ventana */
 static SDL_Window *g_win;
@@ -223,7 +266,15 @@ static VkDescriptorPool g_dpool2;          /* conjuntos por draw: se vacía en c
  * set 1 vacío, set 2 texturas del vértice, set 3 del fragmento. */
 static VkDescriptorSetLayout g_dsl_v3k, g_dsl_empty, g_dsl_tex_all;
 static VkPipelineLayout g_layout3;
-static VkDescriptorPool g_dpool3, g_dpool3_fijo;
+static VkDescriptorPool g_dpool3, g_dpool3_fijo, g_dpool_dyn;
+/* Fase 4b del plan de rendimiento: el conjunto 0 de los shaders v3k (vinfo, finfo, datos de vértice y
+ * de fragmento) usa buffers DINÁMICOS. Cada contexto de escena tiene UN conjunto fijo que apunta a su
+ * búfer de uniformes y cada dibujo solo pasa los offsets (antes se pedía y escribía un conjunto nuevo
+ * por dibujo). Rangos fijos: los datos de un dibujo no pueden pasar de DYN_SB_RANGE (si pasan, se usa
+ * un conjunto propio como antes) y el final del búfer se reserva para que offset + rango quepa. */
+#define DYN_UB_RANGE 256u
+#define DYN_SB_RANGE (64u << 10)
+static VkDescriptorSet g_dset0;
 static VkDescriptorSet g_vtex_white;       /* texturas del vértice: todas blancas */
 static Buffer g_mb;
 static uint32_t g_mb_off;
@@ -283,6 +334,23 @@ static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
  * escritura) es rápida de escribir pero leerla con la CPU es lentísimo, y cada
  * escena copia su superficie de vuelta a la memoria del juego: en el partido
  * (muchas escenas por fotograma) era el 60 % del hilo de dibujo. */
+int gpu_vfmt_ok(uint8_t f, uint8_t c) {
+    static uint8_t ok[10][5];   /* 0 sin mirar, 1 sí, 2 no */
+    if (f >= 10 || c < 1 || c > 4 || !g_ok) return 0;
+    if (!ok[f][c]) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_phys, vfmt_vk(f, c), &fp);
+        ok[f][c] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : 2;
+    }
+    return ok[f][c] == 1;
+}
+static void vb_normal(void) {   /* antes de un dibujo del camino viejo: binding 0 = g_vb desde 0 */
+    if (!g_vb_crudo) return;
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_vb.buf, &zero);
+    g_vb_crudo = 0;
+}
+
 static int buffer_new_ex(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, int readback) {
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bi.size = size;
@@ -463,18 +531,12 @@ static void subida_end(Subida *sb) { if (!sb->async) once_end(); }
 
 /* --- inicialización -------------------------------------------------------- */
 
-static int init_vulkan(void) {
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    if (!lib) { printf("[gpu] no hay vulkan-1.dll: sin dibujo\n"); snprintf(g_vk_error, sizeof(g_vk_error), "no hay vulkan-1.dll"); return 0; }
-    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(lib, "vkGetInstanceProcAddr");
-#define LOADG(f) f = (PFN_##f)vkGetInstanceProcAddr(NULL, #f);
-    VK_GLOBAL(LOADG)
-
-    /* Ventana SDL (salvo MLB15_NOWINDOW=1): la instancia necesita sus extensiones. */
-    const char *exts[16];
-    unsigned int next = 0;
-    const char *nw = env_cached("MLB15_NOWINDOW");
-    if (!(nw && *nw == '1')) {
+/* Hilo de la ventana: la crea y atiende sus mensajes siempre (teclas, ratón, mover, redimensionar,
+ * pantalla completa), dibuje quien dibuje. gpu_present ya solo lee el mando (input_poll). */
+static HANDLE g_win_listo;
+static void manejar_evento(SDL_Event *e);
+static DWORD WINAPI ventana_hilo(LPVOID arg) {
+    (void)arg;
         SDL_SetMainReady();
         /* Pantallas con escalado de Windows (el portátil del usuario: 2560x1600 al 150 %):
          * sin declararse compatible, Windows dibujaba la ventana a 2/3 y la estiraba
@@ -505,12 +567,43 @@ static int init_vulkan(void) {
             }
             if (env_cached("MLB15_VENTANA_OCULTA")) fl |= SDL_WINDOW_HIDDEN;   /* pruebas con ventana sin mostrarla */
             g_win = SDL_CreateWindow("Project Baseball", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ww, wh, fl);
+            g_win_hilo = GetCurrentThreadId();
             if (!g_win) printf("[gpu] SDL_CreateWindow falló: %s (sin ventana)\n", SDL_GetError());
-            else {
-                next = 16;
-                if (!SDL_Vulkan_GetInstanceExtensions(g_win, &next, exts)) next = 0;
-                input_init();   /* carga mapeo de teclas desde MLB15.ini */
-            }
+        }
+    g_win_propio = g_win != NULL;
+    SetEvent(g_win_listo);
+    if (!g_win) return 0;
+    for (;;) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, 20)) {
+            do manejar_evento(&e); while (SDL_PollEvent(&e));
+        }
+    }
+}
+
+static int init_vulkan(void) {
+    HMODULE lib = LoadLibraryA("vulkan-1.dll");
+    if (!lib) { printf("[gpu] no hay vulkan-1.dll: sin dibujo\n"); snprintf(g_vk_error, sizeof(g_vk_error), "no hay vulkan-1.dll"); return 0; }
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(lib, "vkGetInstanceProcAddr");
+#define LOADG(f) f = (PFN_##f)vkGetInstanceProcAddr(NULL, #f);
+    VK_GLOBAL(LOADG)
+
+    /* Ventana SDL (salvo MLB15_NOWINDOW=1): la instancia necesita sus extensiones. */
+    const char *exts[16];
+    unsigned int next = 0;
+    const char *nw = env_cached("MLB15_NOWINDOW");
+    if (!(nw && *nw == '1')) {
+        /* La ventana vive en un hilo propio (ventana_hilo): en Windows solo el hilo que crea una
+         * ventana recibe sus mensajes, y en el partido presenta el hilo «Display Engine», no el que la
+         * creaba (main). Nadie recogía las teclas (el teclado no iba en el partido) y, tras un clic,
+         * Windows la daba por colgada («No responde», imagen blanquecina). */
+        g_win_listo = CreateEventA(NULL, TRUE, FALSE, NULL);
+        HANDLE th = g_win_listo ? CreateThread(NULL, 0, ventana_hilo, NULL, 0, NULL) : NULL;
+        if (th) { WaitForSingleObject(g_win_listo, 15000); CloseHandle(th); }
+        if (g_win) {
+            next = 16;
+            if (!SDL_Vulkan_GetInstanceExtensions(g_win, &next, exts)) next = 0;
+            input_init();   /* carga mapeo de teclas desde MLB15.ini */
         }
     }
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -549,7 +642,18 @@ static int init_vulkan(void) {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g_phys, &props);
     printf("[gpu] tarjeta: %s\n", props.deviceName);
-    { extern void arranque(const char *fmt, ...); arranque("gpu: tarjeta elegida %s; resolución interna x%u", props.deviceName, g_res); }
+    if (env_cached("MLB15_VFMT_TRAZA")) {   /* formatos de vértice que la tarjeta lee directamente */
+        static const struct { VkFormat f; const char *n; } fs[] = {
+            { VK_FORMAT_R8G8B8_UNORM, "u8n x3" }, { VK_FORMAT_R8G8B8_SNORM, "s8n x3" }, { VK_FORMAT_R8G8B8_USCALED, "u8 x3" },
+            { VK_FORMAT_R8G8B8_UINT, "u8 x3 int" }, { VK_FORMAT_R16G16B16_SFLOAT, "f16 x3" }, { VK_FORMAT_R16G16B16_SNORM, "s16n x3" },
+            { VK_FORMAT_R16G16B16_SSCALED, "s16 x3" }, { VK_FORMAT_R8_USCALED, "u8 x1" }, { VK_FORMAT_R8G8B8A8_USCALED, "u8 x4" },
+            { VK_FORMAT_R16G16_SFLOAT, "f16 x2" }, { VK_FORMAT_R32G32B32_SFLOAT, "f32 x3" } };
+        for (unsigned i = 0; i < sizeof(fs) / sizeof(fs[0]); i++) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(g_phys, fs[i].f, &fp);
+            printf("[vfmt] %s: %s\n", fs[i].n, (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? "sí" : "NO");
+        }
+    }
     vkGetPhysicalDeviceMemoryProperties(g_phys, &g_memprops);
 
     uint32_t nq = 0;
@@ -590,6 +694,7 @@ static int init_vulkan(void) {
         int r = e ? atoi(e) : launcher_ini_int("video", "resolucion", 3);
         g_res = r < 1 ? 1u : r > 4 ? 4u : (uint32_t)r;
         printf("[gpu] resolución interna x%u\n", g_res);
+        { extern void arranque(const char *fmt, ...); arranque("gpu: tarjeta elegida %s; resolución interna x%u", props.deviceName, g_res); }
     }
 #define LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(g_dev, #f);
     VK_DEVICE(LOADD)
@@ -739,7 +844,7 @@ static int init_vulkan(void) {
         VkDescriptorSetLayoutBinding vb[4];
         for (uint32_t i = 0; i < 4; i++) {
             vb[i].binding = i;
-            vb[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            vb[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
             vb[i].descriptorCount = 1;
             vb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             vb[i].pImmutableSamplers = NULL;
@@ -755,7 +860,7 @@ static int init_vulkan(void) {
         VkPipelineLayoutCreateInfo l3 = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         l3.setLayoutCount = 4; l3.pSetLayouts = four;
         CHECK(vkCreatePipelineLayout(g_dev, &l3, NULL, &g_layout3));
-        VkDescriptorPoolSize ps3[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768 },
+        VkDescriptorPoolSize ps3[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 32768 },
                                         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384 * 16 } };
         VkDescriptorPoolCreateInfo dp3 = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dp3.maxSets = 32768; dp3.poolSizeCount = 3; dp3.pPoolSizes = ps3;
@@ -777,6 +882,8 @@ static int init_vulkan(void) {
 
     if (!buffer_new(&g_vb, VB_SIZE, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) return 0;
     if (!buffer_new(&g_ib, IB_SIZE, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) return 0;
+    if (!buffer_new(&g_vdef, 256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) return 0;
+    { float def[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; memcpy(g_vdef.ptr, def, sizeof(def)); }
     if (!buffer_new(&g_mb, MB_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return 0;
     g_ctx[0].cmd = g_cmd; g_ctx[0].fence = g_fence; g_ctx[0].vb = g_vb; g_ctx[0].ib = g_ib; g_ctx[0].mb = g_mb;
     for (int k = 1; k < g_nctx; k++) {
@@ -794,6 +901,28 @@ static int init_vulkan(void) {
         ca.commandPool = g_pool; ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
         CHECK(vkAllocateCommandBuffers(g_dev, &ca, &g_ctx[k].ucmd));
         if (!buffer_new(&g_ctx[k].up, UP_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+    }
+    {
+        VkDescriptorPoolSize pd[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * NCTX }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2 * NCTX } };
+        VkDescriptorPoolCreateInfo dpc = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpc.maxSets = NCTX; dpc.poolSizeCount = 2; dpc.pPoolSizes = pd;
+        CHECK(vkCreateDescriptorPool(g_dev, &dpc, NULL, &g_dpool_dyn));
+        for (int k = 0; k < g_nctx; k++) {
+            VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            ai.descriptorPool = g_dpool_dyn; ai.descriptorSetCount = 1; ai.pSetLayouts = &g_dsl_v3k;
+            CHECK(vkAllocateDescriptorSets(g_dev, &ai, &g_ctx[k].dset0));
+            VkBuffer mb = k ? g_ctx[k].mb.buf : g_mb.buf;
+            VkDescriptorBufferInfo bi[4] = { { mb, 0, DYN_UB_RANGE }, { mb, 0, DYN_UB_RANGE }, { mb, 0, DYN_SB_RANGE }, { mb, 0, DYN_SB_RANGE } };
+            VkWriteDescriptorSet w[4];
+            for (int i = 0; i < 4; i++) {
+                memset(&w[i], 0, sizeof(w[i])); w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstSet = g_ctx[k].dset0; w[i].dstBinding = (uint32_t)i; w[i].descriptorCount = 1;
+                w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+                w[i].pBufferInfo = &bi[i];
+            }
+            vkUpdateDescriptorSets(g_dev, 4, w, 0, NULL);
+        }
+        g_dset0 = env_cached("MLB15_SIN_UNIF_DIN") ? VK_NULL_HANDLE : g_ctx[0].dset0;
     }
     printf("[gpu] escenas en vuelo: %d\n", g_nctx);
     if (!buffer_new(&g_tex_staging, 4096u * 4096u * 4u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
@@ -924,6 +1053,70 @@ static VkSampler sampler_for(const GpuTexture *t, uint32_t *index) {
 /* Hash barato del contenido: detecta texturas que el juego reescribe (fuentes,
  * render targets) sin decodificar en cada draw. */
 static uint32_t cube_face_bytes(const GpuTexture *t);
+/* --- páginas escritas (PLAN_RENDIMIENTO.md fase 4b) ---------------------------------------------
+ * La memoria de la Vita se reserva con MEM_WRITE_WATCH (vitarecomp mem.c): Windows apunta qué
+ * páginas se escriben. Una vez por fotograma se recogen y se reinician (ww_scan: cada página
+ * escrita recibe la generación nueva); en cualquier momento, GetWriteWatch sin reiniciar sobre un
+ * rango dice si se escribió desde el último recuento. Así una textura que nadie tocó no se vuelve a
+ * leer para calcular su huella (antes: ~1000 lecturas salteadas por textura y escena, 55 escenas
+ * por fotograma). Lo que escribe la propia GPU de vuelta (escenas copiadas a memoria) también
+ * cuenta: son escrituras normales. Desactivado por defecto: MLB15_WRITEWATCH=1. */
+static uint8_t *g_ww_mem;
+static uint32_t g_ww_base, g_ww_pages, g_ww_gen = 1;
+static size_t g_ww_size;
+static uint32_t *g_ww_pgen;
+static void **g_ww_addrs;
+static int g_ww_on = -1;
+static unsigned g_ww_frame = ~0u;
+static void ww_init(void) {
+    g_ww_on = 0;
+    /* Desactivado por defecto (medido: la huella de texturas ya era barata; sin beneficio no compensa que
+     * una escritura del juego a mitad de fotograma se vea un fotograma tarde). MLB15_WRITEWATCH=1 lo activa. */
+    if (!env_cached("MLB15_WRITEWATCH")) return;
+    vita_mem_window(&g_ww_mem, &g_ww_base, &g_ww_size);
+    if (!g_ww_mem || !g_ww_size) return;
+    ULONG_PTR n = 1; ULONG gran = 0; void *a1;
+    if (GetWriteWatch(0, g_ww_mem, 4096, &a1, &n, &gran) != 0 || gran != 4096) { printf("[gpu] sin vigilancia de escrituras\n"); return; }
+    g_ww_pages = (uint32_t)((g_ww_size + 4095) / 4096);
+    g_ww_pgen = (uint32_t *)calloc(g_ww_pages, sizeof(uint32_t));
+    g_ww_addrs = (void **)malloc((size_t)g_ww_pages * sizeof(void *));
+    if (!g_ww_pgen || !g_ww_addrs) return;
+    g_ww_on = 1;
+    printf("[gpu] vigilancia de escrituras: %u páginas\n", g_ww_pages);
+}
+static void ww_scan(void) {   /* una vez por fotograma */
+    ULONG_PTR n = g_ww_pages; ULONG gran = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_ww_mem, g_ww_size, g_ww_addrs, &n, &gran) != 0) { g_ww_on = 0; return; }
+    g_ww_gen++;
+    for (ULONG_PTR i = 0; i < n; i++) g_ww_pgen[((uint8_t *)g_ww_addrs[i] - g_ww_mem) >> 12] = g_ww_gen;
+}
+/* Escrituras del propio port a mitad de fotograma (escenas copiadas de vuelta a la memoria): se
+ * apuntan a mano para que una textura que lea esa memoria se vuelva a mirar en el acto. */
+static void ww_marca(uint32_t addr, uint32_t bytes) {
+    if (g_ww_on <= 0 || !bytes || addr < g_ww_base || (uint64_t)addr - g_ww_base + bytes > g_ww_size) return;
+    g_ww_gen++;
+    for (uint32_t p = (addr - g_ww_base) >> 12, p1 = (addr - g_ww_base + bytes - 1) >> 12; p <= p1; p++) g_ww_pgen[p] = g_ww_gen;
+}
+/* 1 si nadie escribió en [addr, addr+bytes) desde la generación gen. Windows se consulta una vez
+ * por textura y fotograma (*visto): una escritura de la CPU del juego a mitad de fotograma en una
+ * textura ya mirada se ve en el fotograma siguiente; las del port (ww_marca) en el acto. */
+static int ww_limpio(uint32_t addr, uint32_t bytes, uint32_t gen, uint32_t *visto) {
+    if (g_ww_on < 0) ww_init();
+    if (g_ww_on <= 0 || !gen || !bytes || addr < g_ww_base || (uint64_t)addr - g_ww_base + bytes > g_ww_size) return 0;
+    extern unsigned port_display_frames(void);
+    unsigned fr = port_display_frames();
+    if (fr != g_ww_frame) { g_ww_frame = fr; ww_scan(); if (g_ww_on <= 0) return 0; }
+    uint32_t p0 = (addr - g_ww_base) >> 12, p1 = (addr - g_ww_base + bytes - 1) >> 12;
+    for (uint32_t p = p0; p <= p1; p++) if (g_ww_pgen[p] > gen) return 0;
+    if (*visto == fr + 1u) return 1;
+    ULONG_PTR n = 1; ULONG gran = 0; void *a1;
+    uint8_t *ini = g_ww_mem + ((size_t)p0 << 12);
+    if (GetWriteWatch(0, ini, (size_t)(p1 - p0 + 1) << 12, &a1, &n, &gran) != 0) return 0;
+    if (n == 0) *visto = fr + 1u;
+    return n == 0;
+}
+static unsigned long g_ww_si, g_ww_no;
+
 static uint32_t content_hash(const GpuTexture *t) {
     uint32_t size = t->type == GPU_TEX_CUBE ? cube_face_bytes(t) * 6u : tex_data_size(t);
     const uint8_t *p = size ? (const uint8_t *)vita_mem_ptr(t->data, size) : NULL;
@@ -1434,6 +1627,10 @@ static Texture *texture_get_(const GpuTexture *t) {
     /* El contenido se comprueba una vez por escena (la CPU no reescribe texturas a mitad de una). */
     if (x && x->scene == g_stat_scenes) return x;
     pend_overlap(t->data, t->width * t->height * 8u * (t->type == GPU_TEX_CUBE ? 6u : 1u));
+    uint32_t tbytes = t->type == GPU_TEX_CUBE ? cube_face_bytes(t) * 6u : tex_data_size(t);
+    if (x && ww_limpio(t->data, tbytes, x->ww_gen, &x->ww_frame)) { x->scene = g_stat_scenes; g_ww_si++; return x; }   /* nadie la tocó */
+    g_ww_no++;
+    uint32_t gen_antes = g_ww_gen;
     uint32_t hash = content_hash(t);
     if (!x) {
         if (g_ntex >= MAX_TEXTURES) return NULL;
@@ -1462,6 +1659,10 @@ static Texture *texture_get_(const GpuTexture *t) {
         else upload(x, t);
         x->hash = hash;
     }
+    x->ww_gen = g_ww_on > 0 ? gen_antes : 0;
+    x->ww_frame = 0;
+    if (env_cached("MLB15_WW_ESTAD") && (g_ww_si + g_ww_no) % 20000 == 0)
+        printf("[ww] texturas sin mirar %lu, con huella %lu\n", g_ww_si, g_ww_no);
     return x;
 }
 
@@ -1550,10 +1751,14 @@ static VkBlendOp blend_op(uint8_t f) {
     }
 }
 
+static VkPipeline pipeline_for_l(const GpuDraw *d, uint16_t vsm, uint16_t fsm, uint8_t nattr, uint8_t v3k, uint16_t uint_mask, uint16_t vlay);
 static VkPipeline pipeline_for(const GpuDraw *d, uint16_t vsm, uint16_t fsm, uint8_t nattr, uint8_t v3k, uint16_t uint_mask) {
+    return pipeline_for_l(d, vsm, fsm, nattr, v3k, uint_mask, 0);
+}
+static VkPipeline pipeline_for_l(const GpuDraw *d, uint16_t vsm, uint16_t fsm, uint8_t nattr, uint8_t v3k, uint16_t uint_mask, uint16_t vlay) {
     PipeKey key;
     memset(&key, 0, sizeof(key));
-    key.vs = vsm; key.fs = fsm; key.nattr = nattr; key.v3k = v3k; key.uint_mask = uint_mask;
+    key.vs = vsm; key.fs = fsm; key.nattr = nattr; key.v3k = v3k; key.uint_mask = uint_mask; key.vlay = vlay;
     key.tf = g_cur ? (g_cur->raw16 ? TF_RAW16 : g_cur->tf) : 0;
     key.blend = d->blend; key.color_func = d->color_func; key.alpha_func = d->alpha_func;
     key.color_src = d->color_src; key.color_dst = d->color_dst;
@@ -1591,6 +1796,21 @@ static VkPipeline pipeline_for(const GpuDraw *d, uint16_t vsm, uint16_t fsm, uin
             va[i].format = (uint_mask >> i & 1) ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT;
         }
         vi.vertexAttributeDescriptionCount = nattr;
+    }
+    VkVertexInputBindingDescription vbs[GPU_VLAY_MAXB + 1];
+    if (vsm && vlay) {   /* vértices crudos: un binding por flujo del juego + valores por defecto */
+        const GpuVLayout *l = &g_vlays[vlay - 1];
+        for (uint32_t b = 0; b < l->nbind; b++) {
+            vbs[b].binding = b; vbs[b].stride = l->stride[b];
+            vbs[b].inputRate = l->inst[b] ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+        }
+        vbs[l->nbind].binding = l->nbind; vbs[l->nbind].stride = 0; vbs[l->nbind].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        for (uint32_t i = 0; i < nattr && i < 16; i++) {
+            va[i].location = i;
+            if (l->loc_bind[i] == 0xFF) { va[i].binding = l->nbind; va[i].offset = 0; va[i].format = VK_FORMAT_R32G32B32A32_SFLOAT; }
+            else { va[i].binding = l->loc_bind[i]; va[i].offset = l->loc_off[i]; va[i].format = vfmt_vk(l->loc_fmt[i] >> 4, l->loc_fmt[i] & 15); }
+        }
+        vi.vertexBindingDescriptionCount = l->nbind + 1u; vi.pVertexBindingDescriptions = vbs;
     }
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1729,6 +1949,7 @@ void gpu_scene_begin(uint32_t addr, uint32_t w, uint32_t h, uint32_t stride, int
         GCtx *c = &g_ctx[g_ctx_i];
         CTXC(c, 2);
         g_cmd = c->cmd; g_fence = c->fence; g_vb = c->vb; g_ib = c->ib; g_mb = c->mb; g_dpool2 = c->dp2; g_dpool3 = c->dp3;
+        if (g_dset0) g_dset0 = c->dset0;
         c->up_off = 0; c->u_open = 0;
     }
     g_cur = t;
@@ -1868,6 +2089,7 @@ void gpu_scene_begin(uint32_t addr, uint32_t w, uint32_t h, uint32_t stride, int
     g_dyn.vp = g_dyn.full = vp; g_dyn.vp_ok = 1;
     VkDeviceSize zero = 0;
     vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_vb.buf, &zero);
+    g_vb_crudo = 0;
     vkCmdBindIndexBuffer(g_cmd, g_ib.buf, 0, VK_INDEX_TYPE_UINT32);
     /* el mutex queda tomado hasta gpu_scene_end: una escena a la vez */
 }
@@ -1903,6 +2125,7 @@ void gpu_draw(const GpuDraw *d, const GpuVertex *v, uint32_t nv, const uint32_t 
     g_dyn.tex = VK_NULL_HANDLE;   /* otro layout: los conjuntos de texturas de v3k ya no valen */
     vkCmdPushConstants(g_cmd, g_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(pc), &pc);
+    vb_normal();
     vkCmdDrawIndexed(g_cmd, ni, 1, g_ib_off / 4u, (int32_t)(g_vb_off / sizeof(GpuVertex)), 0);
     g_vb_off += vbytes;
     g_ib_off += ibytes;
@@ -1976,6 +2199,7 @@ void gpu_draw_prog(const GpuDraw *d, int vsm, int fsm, uint32_t nattr, const flo
     vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout2, 0, 2, sets, 0, NULL);
     g_dyn.tex = VK_NULL_HANDLE;
     vkCmdPushConstants(g_cmd, g_layout2, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+    vb_normal();
     vkCmdDrawIndexed(g_cmd, ni, 1, g_ib_off / 4u, (int32_t)(voff / stride), 0);
     g_vb_off = voff + vbytes;
     g_ib_off += ibytes;
@@ -2091,24 +2315,53 @@ static VkDescriptorSet texset_busca(const VkDescriptorImageInfo ii[16], uint32_t
     return VK_NULL_HANDLE;
 }
 
+static void draw_v3k_x(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t uint_mask, const float *verts, uint32_t nv,
+                       const uint32_t *idx, uint32_t ni, const void *vinfo, uint32_t vinfo_bytes, const void *finfo,
+                       uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data, const void *fdata, uint32_t fbytes_data,
+                       const float viewport[4], const GpuTexture *const tex[16], const GpuVLayout *lay,
+                       const uint8_t *const *bdata, const uint32_t *bbytes, uint32_t ninst);
 void gpu_draw_v3k(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t uint_mask, const float *verts, uint32_t nv,
                   const uint32_t *idx, uint32_t ni, const void *vinfo, uint32_t vinfo_bytes, const void *finfo,
                   uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data, const void *fdata, uint32_t fbytes_data,
                   const float viewport[4], const GpuTexture *const tex[16]) {
+    draw_v3k_x(d, vsm, fsm, nloc, uint_mask, verts, nv, idx, ni, vinfo, vinfo_bytes, finfo, finfo_bytes, vdata, vbytes_data,
+               fdata, fbytes_data, viewport, tex, NULL, NULL, NULL, 1);
+}
+void gpu_draw_v3k_crudo(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, const GpuVLayout *lay,
+                        const uint8_t *const bdata[GPU_VLAY_MAXB], const uint32_t bbytes[GPU_VLAY_MAXB], uint32_t ninst,
+                        uint32_t nv, const uint32_t *idx, uint32_t ni, const void *vinfo, uint32_t vinfo_bytes,
+                        const void *finfo, uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data,
+                        const void *fdata, uint32_t fbytes_data, const float viewport[4], const GpuTexture *const tex[16]) {
+    draw_v3k_x(d, vsm, fsm, nloc, 0, NULL, nv, idx, ni, vinfo, vinfo_bytes, finfo, finfo_bytes, vdata, vbytes_data,
+               fdata, fbytes_data, viewport, tex, lay, bdata, bbytes, ninst ? ninst : 1);
+}
+static void draw_v3k_x(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t uint_mask, const float *verts, uint32_t nv,
+                       const uint32_t *idx, uint32_t ni, const void *vinfo, uint32_t vinfo_bytes, const void *finfo,
+                       uint32_t finfo_bytes, const void *vdata, uint32_t vbytes_data, const void *fdata, uint32_t fbytes_data,
+                       const float viewport[4], const GpuTexture *const tex[16], const GpuVLayout *lay,
+                       const uint8_t *const *bdata, const uint32_t *bbytes, uint32_t ninst) {
     g_last_fdata_off = ~0u;
     if (!g_ok || !g_cur || !nv || !ni || !vsm || !fsm) return;
     if (!nloc) nloc = 1;
     uint32_t stride = 16u * nloc;
     uint32_t vbytes = nv * stride, ibytes = ni * 4u;
+    uint16_t vlay = 0;
+    if (lay) {   /* crudos: cada flujo alineado a 16 */
+        vbytes = 0;
+        for (uint32_t b = 0; b < lay->nbind; b++) vbytes += (bbytes[b] + 15u) & ~15u;
+        stride = 16u;
+        vlay = vlay_id(lay);
+        if (!vlay) return;
+    }
     uint32_t need = 4u * 256u + ((vinfo_bytes + finfo_bytes + vbytes_data + fbytes_data + 4u * 255u) & ~255u);
     uint32_t voff = (g_vb_off + stride - 1) / stride * stride;
-    if (voff + vbytes > VB_SIZE || g_ib_off + ibytes > IB_SIZE || g_mb_off + need > MB_SIZE) {
+    if (voff + vbytes > VB_SIZE || g_ib_off + ibytes > IB_SIZE || g_mb_off + need > MB_SIZE - DYN_SB_RANGE) {
         g_drop_lleno++;
         if (voff + vbytes > VB_SIZE) g_drop_vb++;
         return;
     }
     double e0 = prof_now();
-    VkPipeline p = pipeline_for(d, (uint16_t)vsm, (uint16_t)fsm, (uint8_t)nloc, 1, (uint16_t)uint_mask);
+    VkPipeline p = pipeline_for_l(d, (uint16_t)vsm, (uint16_t)fsm, (uint8_t)nloc, 1, (uint16_t)uint_mask, vlay);
     double e1 = prof_now(); g_envio_t[0] += e1 - e0;
     if (!p) {
         static int told;
@@ -2127,18 +2380,60 @@ void gpu_draw_v3k(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t ui
     }
     double e2 = prof_now();
     VkDescriptorImageInfo ii[16];
-    tex_infos(tex, ii);
-    double e3 = prof_now(); g_envio_t[1] += e3 - e2;
     static int sin_cache = -1;
     if (sin_cache < 0) sin_cache = env_cached("MLB15_SIN_CACHE_TEX") ? 1 : 0;
+    /* Mismas texturas que el dibujo anterior de esta escena (lo normal): mismo resultado y mismo
+     * conjunto, sin recorrer las 16 unidades (fase 4b). MLB15_SIN_TEX_ANTERIOR=1 lo quita. */
+    static GpuTexture prev_t[16];
+    static uint8_t prev_has[16];
+    static VkDescriptorImageInfo prev_ii[16];
+    static VkDescriptorSet prev_set;
+    static uint32_t prev_esc = ~0u;
+    static int sin_prev = -1;
+    if (sin_prev < 0) sin_prev = env_cached("MLB15_SIN_TEX_ANTERIOR") ? 1 : 0;
+    int igual = !sin_prev && !sin_cache && prev_esc == g_texset_esc && prev_set;
+    for (int u = 0; u < 16 && igual; u++) {
+        uint8_t has = tex && tex[u] && tex[u]->data && tex[u]->width && tex[u]->height;
+        if (has != prev_has[u] || (has && memcmp(tex[u], &prev_t[u], sizeof(GpuTexture)))) igual = 0;
+    }
+    if (igual) memcpy(ii, prev_ii, sizeof(ii));
+    else tex_infos(tex, ii);
+    {   /* MLB15_TEX_ESTAD=1: cuántas veces sirve el dibujo anterior y cuántas texturas usa cada dibujo */
+        static int on = -1; static unsigned long n, si, unid, memo_mal;
+        if (on < 0) on = env_cached("MLB15_TEX_ESTAD") ? 1 : 0;
+        if (on) {
+            n++; si += igual;
+            for (int u = 0; u < 16; u++) if (tex && tex[u] && tex[u]->data) unid++;
+            if (n % 300000 == 0) printf("[texestad] dibujos %lu, igual al anterior %lu (%.0f %%), unidades/dibujo %.2f\n", n, si, 100.0 * si / n, (double)unid / n);
+        }
+    }
+    double e3 = prof_now(); g_envio_t[1] += e3 - e2;
     uint32_t th = 0, tslot = ~0u;
     VkDescriptorSet sets[2];
-    sets[1] = sin_cache ? VK_NULL_HANDLE : texset_busca(ii, &th, &tslot);
+    sets[1] = igual ? prev_set : sin_cache ? VK_NULL_HANDLE : texset_busca(ii, &th, &tslot);
     VkDescriptorSetLayout lays[2] = { g_dsl_v3k, g_dsl_tex_all };
+    int dyn = g_dset0 && vinfo_bytes <= DYN_UB_RANGE && finfo_bytes <= DYN_UB_RANGE && vbytes_data <= DYN_SB_RANGE &&
+              fbytes_data <= DYN_SB_RANGE;
     VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    ai.descriptorPool = g_dpool3; ai.descriptorSetCount = sets[1] ? 1 : 2; ai.pSetLayouts = lays;
-    if (vkAllocateDescriptorSets(g_dev, &ai, sets) != VK_SUCCESS) { g_drop_ds++; return; }
-    int tex_nuevo = ai.descriptorSetCount == 2;
+    ai.descriptorPool = g_dpool3;
+    int tex_nuevo = !sets[1];
+    if (dyn) {
+        sets[0] = g_dset0;
+        if (tex_nuevo) {
+            ai.descriptorSetCount = 1; ai.pSetLayouts = &lays[1];
+            if (vkAllocateDescriptorSets(g_dev, &ai, &sets[1]) != VK_SUCCESS) { g_drop_ds++; return; }
+        }
+    } else {
+        ai.descriptorSetCount = sets[1] ? 1 : 2; ai.pSetLayouts = lays;
+        if (vkAllocateDescriptorSets(g_dev, &ai, sets) != VK_SUCCESS) { g_drop_ds++; return; }
+    }
+    if (!sin_prev) {
+        for (int u = 0; u < 16; u++) {
+            prev_has[u] = tex && tex[u] && tex[u]->data && tex[u]->width && tex[u]->height;
+            if (prev_has[u]) prev_t[u] = *tex[u];
+        }
+        memcpy(prev_ii, ii, sizeof(ii)); prev_set = sets[1]; prev_esc = g_texset_esc;
+    }
     if (tex_nuevo && tslot != ~0u) {
         g_texset_gen[tslot] = g_texset_esc; g_texset[tslot].h = th;
         memcpy(g_texset[tslot].ii, ii, sizeof(ii)); g_texset[tslot].set = sets[1];
@@ -2164,17 +2459,30 @@ void gpu_draw_v3k(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t ui
     g_mb_cero = 1;
     VkWriteDescriptorSet w[5];
     for (int i = 0; i < 5; i++) { memset(&w[i], 0, sizeof(w[i])); w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; }
+    uint32_t doffs[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < 4; i++) {
         w[i].dstSet = sets[0]; w[i].dstBinding = (uint32_t)i; w[i].descriptorCount = 1;
-        w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         w[i].pBufferInfo = &bi[i];
+        if (dyn) doffs[i] = (uint32_t)bi[i].offset;
     }
     w[4].dstSet = sets[1]; w[4].descriptorCount = 16; w[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[4].pImageInfo = ii;
     double e5 = prof_now(); g_envio_t[3] += e5 - e4;
-    vkUpdateDescriptorSets(g_dev, tex_nuevo ? 5 : 4, w, 0, NULL);
+    if (dyn) { if (tex_nuevo) vkUpdateDescriptorSets(g_dev, 1, &w[4], 0, NULL); }
+    else vkUpdateDescriptorSets(g_dev, tex_nuevo ? 5 : 4, w, 0, NULL);
     double e6 = prof_now(); g_envio_t[4] += e6 - e5;
 
-    memcpy((uint8_t *)g_vb.ptr + voff, verts, vbytes);
+    VkDeviceSize boffs[GPU_VLAY_MAXB + 1];
+    VkBuffer bbufs[GPU_VLAY_MAXB + 1];
+    if (lay) {
+        uint32_t o = voff;
+        for (uint32_t b = 0; b < lay->nbind; b++) {
+            memcpy((uint8_t *)g_vb.ptr + o, bdata[b], bbytes[b]);
+            bbufs[b] = g_vb.buf; boffs[b] = o;
+            o += (bbytes[b] + 15u) & ~15u;
+        }
+        bbufs[lay->nbind] = g_vdef.buf; boffs[lay->nbind] = 0;
+    } else memcpy((uint8_t *)g_vb.ptr + voff, verts, vbytes);
     memcpy((uint8_t *)g_ib.ptr + g_ib_off, idx, ibytes);
     double e7 = prof_now(); g_envio_t[5] += e7 - e6;
 
@@ -2184,12 +2492,19 @@ void gpu_draw_v3k(const GpuDraw *d, int vsm, int fsm, uint32_t nloc, uint32_t ui
     dyn_estado(p, d);
     dyn_viewport(&vp);
     VkDescriptorSet tail[2] = { g_vtex_white, sets[1] };
-    vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout3, 0, 1, &sets[0], 0, NULL);
+    vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout3, 0, 1, &sets[0], 4, doffs);
     if (g_dyn.tex != sets[1] || g_dyn.layout != g_layout3) {
         vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout3, 2, 2, tail, 0, NULL);
         g_dyn.tex = sets[1]; g_dyn.layout = g_layout3;
     }
-    vkCmdDrawIndexed(g_cmd, ni, 1, g_ib_off / 4u, (int32_t)(voff / stride), 0);
+    if (lay) {
+        vkCmdBindVertexBuffers(g_cmd, 0, lay->nbind + 1u, bbufs, boffs);
+        g_vb_crudo = 1;
+        vkCmdDrawIndexed(g_cmd, ni, ninst, g_ib_off / 4u, 0, 0);
+    } else {
+        vb_normal();
+        vkCmdDrawIndexed(g_cmd, ni, 1, g_ib_off / 4u, (int32_t)(voff / stride), 0);
+    }
     g_envio_t[6] += prof_now() - e7;
     (void)full;   /* (antes se reponía el viewport completo tras cada draw: dyn_viewport lo hace si hace falta) */
     g_vb_off = voff + vbytes;
@@ -2487,9 +2802,11 @@ static void scene_finish(Target *t) {
     uint32_t bpp = g_tfmt_bpp[t->tf];
     uint8_t *dst = t->resident ? NULL : (uint8_t *)vita_mem_ptr(t->addr, t->gstride * t->h * bpp);
     const uint8_t *src = (const uint8_t *)t->staging.ptr;
-    if (dst)
+    if (dst) {
         for (uint32_t y = 0; y < t->rh; y++)
             memcpy(dst + (size_t)y * t->gstride * bpp, src + (size_t)y * t->w * bpp, (size_t)t->rw * bpp);
+        ww_marca(t->addr, t->gstride * t->rh * bpp);
+    }
     {   /* MLB15_ESCENA_TAM: media de lo que vuelve a la memoria */
         static uint32_t ew = 1, eh;
         if (ew == 1) { const char *e = env_cached("MLB15_ESCENA_TAM"); ew = 0; if (e) sscanf(e, "%ux%u", &ew, &eh); }
@@ -2898,9 +3215,9 @@ static void osd_record(VkCommandBuffer cb, VkImage dst) {
     vkCmdCopyBufferToImage(cb, g_osd_buf.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
 }
 
-static void pump_events(void) {
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
+static void manejar_evento(SDL_Event *ep) {
+    SDL_Event e = *ep;
+    {
         int full = (SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
         /* Alt+Enter o F11: pantalla completa (se guarda en MLB15.ini). En pantalla
          * completa Esc solo sale de ella; en ventana cierra el port. */
@@ -2910,14 +3227,14 @@ static void pump_events(void) {
             full = !full;
             SDL_SetWindowFullscreen(g_win, full ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
             launcher_ini_set_int("video", "pantalla_completa", full);
-            continue;                       /* que Enter no llegue al juego como Start */
+            return;                         /* que Enter no llegue al juego como Start */
         }
         /* F10: mostrar/ocultar los FPS ([video] mostrar_fps). */
         if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F10) {
             if (g_osd_fps < 0) g_osd_fps = launcher_ini_int("video", "mostrar_fps", 0) ? 1 : 0;
             g_osd_fps = !g_osd_fps;
             launcher_ini_set_int("video", "mostrar_fps", g_osd_fps);
-            continue;
+            return;
         }
         /* F9: resolución interna x1 -> x2 -> x3 -> x4 -> x1 ([video] resolucion). Las superficies
          * ya creadas tienen el tamaño de la anterior, así que se aplica al reiniciar el juego. */
@@ -2929,7 +3246,7 @@ static void pump_events(void) {
             else snprintf(g_osd_aviso, sizeof(g_osd_aviso), "RESOLUCION X%d AL REINICIAR", r);
             g_osd_aviso_hasta = GetTickCount64() + 3000;
             printf("[gpu] F9: resolución x%d guardada (ahora x%u)\n", r, g_res);
-            continue;
+            return;
         }
         if (e.type == SDL_QUIT || (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)) {
             printf("[gpu] ventana cerrada: fin\n");
@@ -2937,6 +3254,13 @@ static void pump_events(void) {
             ExitProcess(0);
         }
         input_event(&e);
+    }
+}
+
+static void pump_events(void) {
+    if (!g_win_propio) {   /* sin hilo de ventana (no debería pasar): como antes */
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) manejar_evento(&e);
     }
     input_poll();
 }

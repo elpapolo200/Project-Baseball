@@ -14,6 +14,7 @@
  */
 
 #include <math.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -736,9 +737,39 @@ static int dp_other(uint32_t a) {
     return dp_misc2(a);
 }
 
+/* MLB 15 port: neon_estad = 1 counts executed encodings by operation (registers masked out), to
+ * pick which ones to translate ahead of time. neon_estad_dump prints the busiest. */
+int neon_estad;
+#define NE_N 4096
+static struct { uint32_t key, raw; uint64_t n; } g_ne[NE_N];
+static uint64_t g_ne_tot;
+static void ne_add(uint32_t a, uint32_t raw) {
+    uint32_t key = a & 0x01B00F50u;   /* U, bit 23, size, opc, Q, B */
+    uint32_t h = (key * 2654435761u) >> 20;
+    for (uint32_t i = 0; i < NE_N; i++) {
+        uint32_t s2 = (h + i) & (NE_N - 1);
+        if (!g_ne[s2].n) { g_ne[s2].key = key; g_ne[s2].raw = raw; }
+        if (g_ne[s2].key == key) { g_ne[s2].n++; break; }
+    }
+    g_ne_tot++;
+}
+void neon_estad_dump(void (*out)(const char *line)) {
+    char b[160];
+    for (int k = 0; k < 24; k++) {
+        int best = -1;
+        for (int i = 0; i < NE_N; i++) if (g_ne[i].n && (best < 0 || g_ne[i].n > g_ne[best].n)) best = i;
+        if (best < 0) break;
+        snprintf(b, sizeof(b), "[neon] %5.1f %% clave %08X ejemplo %08X n %llu", 100.0 * (double)g_ne[best].n / (double)(g_ne_tot ? g_ne_tot : 1),
+                 g_ne[best].key, g_ne[best].raw, (unsigned long long)g_ne[best].n);
+        out(b);
+        g_ne[best].n = 0;
+    }
+}
+
 void neon_dp(uint32_t pc, uint32_t raw) {
     uint32_t a = (((raw >> 28) & 1) << 24) | (raw & 0x00FFFFFFu);
     int ok;
+    if (neon_estad) ne_add(a, raw);
     if (!BIT(a, 23))                                       ok = dp_3same(a);
     else if (BIT(a, 4) && ((a >> 19) & 7) == 0 && !BIT(a, 7)) ok = dp_modimm(a);
     else if (BIT(a, 4))                                    ok = dp_shift(a);

@@ -282,6 +282,12 @@ static void present(uint32_t base, int w, int h, uint32_t pitch, uint32_t format
          * ~1,5 ms antes y el resto se espera cediendo la CPU. Si va retrasado, no recupera. */
         static int periodo;
         if (!periodo) { timeBeginPeriod(1); periodo = 1; }
+        {   /* MLB15_NEON_ESTAD=n: cuenta las instrucciones NEON ejecutadas y las vuelca en el fotograma n */
+            extern int neon_estad; extern void neon_estad_dump(void (*out)(const char *));
+            static long cuando = -2; static unsigned fot;
+            if (cuando == -2) { const char *e = getenv("MLB15_NEON_ESTAD"); cuando = e ? atol(e) : -1; if (cuando > 0) neon_estad = 1; }
+            if (cuando > 0 && ++fot == (unsigned)cuando) { neon_estad_dump((void (*)(const char *))puts); fflush(stdout); }
+        }
         double f = (double)g_qpc_freq.QuadPart, target = 1.0 / g_fps_limit;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);

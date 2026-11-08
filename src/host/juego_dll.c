@@ -11,9 +11,11 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "vitarecomp/cpu.h"
 #include "vitarecomp/recomp_rt.h"
+#include "vitarecomp/mem.h"
 #include "juego_dll.h"
 
 void (*juego_register_functions)(void);
@@ -26,6 +28,17 @@ static FARPROC pide(HMODULE h, const char *nombre, int obligatorio) {
     FARPROC p = GetProcAddress(h, nombre);
     if (!p && obligatorio) printf("[juego] juego.dll no exporta %s\n", nombre);
     return p;
+}
+
+/* Memoria en línea (PLAN_RENDIMIENTO.md fase 1): el DLL accede a la memoria de la Vita sin llamar
+ * al exe. main.c reserva la ventana después de cargar el DLL y entonces llama a juego_memoria().
+ * Con un DLL de antes no existe la función y todo sigue por las funciones del exe. */
+static void (*g_mem_directa)(unsigned char *, uint32_t, unsigned long long);
+void juego_memoria(void) {
+    uint8_t *mem = NULL; uint32_t base = 0; size_t tam = 0;
+    vita_mem_window(&mem, &base, &tam);
+    if (g_mem_directa && mem && !getenv("MLB15_MEM_LLAMADAS")) g_mem_directa(mem, base, (unsigned long long)tam);
+    printf("[juego] memoria en línea: %s\n", !g_mem_directa ? "no (juego.dll antiguo)" : getenv("MLB15_MEM_LLAMADAS") ? "no (MLB15_MEM_LLAMADAS)" : "sí");
 }
 
 int juego_cargar(const char *ruta) {
@@ -43,6 +56,7 @@ int juego_cargar(const char *ruta) {
     const uint32_t *n = (const uint32_t *)pide(h, "vita_import_var_count", 1);
     if (!vita_cpu_fuente || !juego_register_functions || !juego_module_start || !juego_import_vars || !n) return -1;
     juego_import_var_count = *n;
+    g_mem_directa = (void (*)(unsigned char *, uint32_t, unsigned long long))pide(h, "vita_mem_directa", 0);
     /* Este hilo pudo usar los registros provisionales (cpu.c) antes de cargar el DLL. */
     vita_cpu_p = NULL;
     printf("[juego] %s cargado (%u variables importadas)\n", ruta, juego_import_var_count);

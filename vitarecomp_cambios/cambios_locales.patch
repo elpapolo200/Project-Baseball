@@ -52,7 +52,7 @@ index b209751..2d75382 100644
  
 -/* NZCV, held as separate ints rather than packed into a CPSR word.
 - *
-- * ARM leans on these far harder than MIPS does ΓÇö a comparison and its branch
+- * ARM leans on these far harder than MIPS does — a comparison and its branch
 - * are separate instructions with arbitrary distance between them, and carry
 - * feeds ADC/SBC chains. Keeping them unpacked means the compiler can usually
 - * fold a flag write into the operation that produced it, and it makes the
@@ -140,6 +140,87 @@ index 77b0c83..db4b66f 100644
  /* Bytes handed out and the high-water mark, for telling "the program leaks"
   * from "the heap was too small". */
  uint32_t vita_heap_used(void);
+diff --git a/include/vitarecomp/mem.h b/include/vitarecomp/mem.h
+index 811e042..31c48b1 100644
+--- a/include/vitarecomp/mem.h
++++ b/include/vitarecomp/mem.h
+@@ -38,6 +38,69 @@ void *vita_mem_ptr(uint32_t addr, uint32_t len);
+  * much is there is a legitimate question. */
+ uint32_t vita_mem_avail(uint32_t addr);
+ 
++/* The flat window, so a separately built image (the MLB 15 port's game DLL) can
++ * reach guest memory without a call per access: host = mem + (addr - base). */
++void vita_mem_window(uint8_t **mem, uint32_t *base, size_t *size);
++
++#if defined(VITA_MEM_DIRECTA)
++/* MLB 15 port, 2026-11-08 (PLAN_RENDIMIENTO.md, fase 1). In the game DLL every
++ * load/store used to be an imported call into the exe, then vita_mem_ptr, then
++ * memcpy: three calls per access, millions per second. Here it is one compare
++ * and a direct access; anything outside the window (or before the window is
++ * set) still goes to the exe's functions, which count it exactly as before. */
++extern uintptr_t vita_md_off;   /* (uintptr_t)mem - base */
++extern uint32_t  vita_md_base;
++extern uint32_t  vita_md_lim;   /* size - 3: a 4-byte access at off < lim fits; 0 = not set */
++uint32_t vita_read32_lento(uint32_t addr) __asm__("vita_read32");
++uint16_t vita_read16_lento(uint32_t addr) __asm__("vita_read16");
++uint8_t  vita_read8_lento (uint32_t addr) __asm__("vita_read8");
++void vita_write32_lento(uint32_t addr, uint32_t v) __asm__("vita_write32");
++void vita_write16_lento(uint32_t addr, uint16_t v) __asm__("vita_write16");
++void vita_write8_lento (uint32_t addr, uint8_t  v) __asm__("vita_write8");
++#define VITA_MD_DENTRO(a) ((uint32_t)((a) - vita_md_base) < vita_md_lim)
++#define VITA_MD_P(a) (vita_md_off + (uintptr_t)(uint32_t)(a))
++/* volatile: every guest access really happens, in order. Without it the compiler,
++ * now seeing plain memory instead of a call, hoisted loads out of the game's spin
++ * loops (a thread waiting for another to set a flag never saw it change: the
++ * frontend hung). Still no call, just a compare and one mov. aligned(1): guest
++ * addresses need not be aligned (fine on x86). */
++typedef volatile uint32_t __attribute__((aligned(1))) vita_md_u32;
++typedef volatile uint16_t __attribute__((aligned(1))) vita_md_u16;
++typedef volatile uint8_t vita_md_u8;
++static inline uint32_t vita_md_read32(uint32_t a) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) return *(vita_md_u32 *)VITA_MD_P(a);
++    return vita_read32_lento(a);
++}
++static inline uint16_t vita_md_read16(uint32_t a) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) return *(vita_md_u16 *)VITA_MD_P(a);
++    return vita_read16_lento(a);
++}
++static inline uint8_t vita_md_read8(uint32_t a) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) return *(vita_md_u8 *)VITA_MD_P(a);
++    return vita_read8_lento(a);
++}
++static inline void vita_md_write32(uint32_t a, uint32_t v) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) { *(vita_md_u32 *)VITA_MD_P(a) = v; return; }
++    vita_write32_lento(a, v);
++}
++static inline void vita_md_write16(uint32_t a, uint16_t v) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) { *(vita_md_u16 *)VITA_MD_P(a) = v; return; }
++    vita_write16_lento(a, v);
++}
++static inline void vita_md_write8(uint32_t a, uint8_t v) {
++    if (__builtin_expect(VITA_MD_DENTRO(a), 1)) { *(vita_md_u8 *)VITA_MD_P(a) = v; return; }
++    vita_write8_lento(a, v);
++}
++/* Distinct names + macros: a static function called vita_read32 would share the
++ * symbol the slow path's asm label points at, and an out-of-window access then
++ * called itself forever (the frontend hung at 98 % CPU). */
++#define vita_read32(a)     vita_md_read32(a)
++#define vita_read16(a)     vita_md_read16(a)
++#define vita_read8(a)      vita_md_read8(a)
++#define vita_write32(a, v) vita_md_write32(a, v)
++#define vita_write16(a, v) vita_md_write16(a, v)
++#define vita_write8(a, v)  vita_md_write8(a, v)
++#else
+ uint32_t vita_read32(uint32_t addr);
+ uint16_t vita_read16(uint32_t addr);
+ uint8_t  vita_read8 (uint32_t addr);
+@@ -45,5 +108,6 @@ uint8_t  vita_read8 (uint32_t addr);
+ void vita_write32(uint32_t addr, uint32_t v);
+ void vita_write16(uint32_t addr, uint16_t v);
+ void vita_write8 (uint32_t addr, uint8_t  v);
++#endif
+ 
+ #endif /* VITARECOMP_MEM_H */
 diff --git a/include/vitarecomp/recomp_rt.h b/include/vitarecomp/recomp_rt.h
 index f1f199d..61d927a 100644
 --- a/include/vitarecomp/recomp_rt.h
@@ -308,8 +389,8 @@ index 741c3cc..044805c 100644
 --- a/src/cpu.c
 +++ b/src/cpu.c
 @@ -1,9 +1,15 @@
--/* cpu.c ΓÇö the machine state the generated C operates on. */
-+/* cpu.c ΓÇö the machine state the generated C operates on (see cpu.h). */
+-/* cpu.c — the machine state the generated C operates on. */
++/* cpu.c — the machine state the generated C operates on (see cpu.h). */
  
  #include "vitarecomp/cpu.h"
  
@@ -330,13 +411,38 @@ index 741c3cc..044805c 100644
 +VITA_TLS vita_cpu_state vita_cpu;
 +#endif
 diff --git a/src/dispatch.c b/src/dispatch.c
-index 0465bec..2b0e8a2 100644
+index 0465bec..0b4be49 100644
 --- a/src/dispatch.c
 +++ b/src/dispatch.c
-@@ -9,6 +9,34 @@ static const vita_dispatch_entry *g_table;
- static uint32_t g_count;
- static uint32_t g_hits, g_misses;
+@@ -2,17 +2,64 @@
  
+ #include "vitarecomp/dispatch.h"
+ #include "vitarecomp/recomp_rt.h"
++#include "vitarecomp/cpu.h"   /* VITA_TLS */
+ 
+ #include <stdio.h>
++#include <string.h>
+ 
+ static const vita_dispatch_entry *g_table;
+ static uint32_t g_count;
+-static uint32_t g_hits, g_misses;
++static uint32_t g_misses;
++
++/* MLB 15 port, 2026-11-08 (PLAN_RENDIMIENTO.md fase 5): a per-thread cache of recent targets in
++ * front of the binary search. A game's indirect calls (C++ virtual methods, callbacks) go to a few
++ * hundred functions over and over; a 42 000-entry binary search is ~16 dependent loads, the cache
++ * one compare. Per thread, so there is no locking and no torn entry. The hit counter is per thread
++ * too: a shared one written by every thread on every call kept a cache line bouncing between
++ * cores. g_dgen bumps whenever the table or an override changes, and each thread drops its cache
++ * when it sees a new generation. */
++#define DCACHE 1024u
++typedef struct { uint32_t addr; vita_fn fn; } dcache_e;
++static VITA_TLS dcache_e t_dc[DCACHE];
++static VITA_TLS uint32_t t_dc_gen;
++static VITA_TLS uint32_t t_hits;
++static volatile uint32_t g_dgen = 1;
++static inline uint32_t dc_slot(uint32_t key) { return (key * 2654435761u) >> 22; }   /* 10 bits */
++
 +/* Overrides set by the host: checked before the table, so a host function can
 + * stand in for (or wrap) a recompiled one on indirect calls. A handful at most,
 + * so a linear scan; with none set the cost is one compare. */
@@ -347,11 +453,12 @@ index 0465bec..2b0e8a2 100644
 +int vita_dispatch_override(uint32_t addr, vita_fn fn) {
 +    addr &= ~1u;
 +    for (uint32_t i = 0; i < g_nover; i++)
-+        if (g_over[i].addr == addr) { g_over[i].fn = fn; return 1; }
++        if (g_over[i].addr == addr) { g_over[i].fn = fn; g_dgen++; return 1; }
 +    if (g_nover >= MAX_OVERRIDES) return 0;
 +    g_over[g_nover].addr = addr;
 +    g_over[g_nover].fn = fn;
 +    g_nover++;
++    g_dgen++;
 +    return 1;
 +}
 +
@@ -364,20 +471,46 @@ index 0465bec..2b0e8a2 100644
 +    }
 +    return 0;
 +}
-+
+ 
  void vita_dispatch_init(const vita_dispatch_entry *table, uint32_t count) {
      g_table = table;
      g_count = count;
-@@ -40,6 +68,9 @@ void vita_dispatch(uint32_t from, uint32_t addr) {
+-    g_hits = g_misses = 0;
++    t_hits = g_misses = 0;
++    g_dgen++;
+ 
+     /* The binary search below assumes a sorted table, and an unsorted one does
+      * not crash — it silently fails to find entries that are present, so the
+@@ -32,7 +79,7 @@ void vita_dispatch_init(const vita_dispatch_entry *table, uint32_t count) {
+     }
+ }
+ 
+-uint32_t vita_dispatch_hits(void)   { return g_hits; }
++uint32_t vita_dispatch_hits(void)   { return t_hits; }   /* this thread's */
+ uint32_t vita_dispatch_misses(void) { return g_misses; }
+ 
+ void vita_dispatch(uint32_t from, uint32_t addr) {
+@@ -40,11 +87,19 @@ void vita_dispatch(uint32_t from, uint32_t addr) {
       * code carries it, so failing to mask means every lookup misses by one. */
      uint32_t key = addr & ~1u;
  
++    if (t_dc_gen != g_dgen) { memset(t_dc, 0, sizeof(t_dc)); t_dc_gen = g_dgen; }
++    dcache_e *e = &t_dc[dc_slot(key)];
++    if (e->addr == key && key) { t_hits++; e->fn(); return; }
++
 +    for (uint32_t i = 0; i < g_nover; i++)
-+        if (g_over[i].addr == key) { g_hits++; g_over[i].fn(); return; }
++        if (g_over[i].addr == key) { t_hits++; e->addr = key; e->fn = g_over[i].fn; g_over[i].fn(); return; }
 +
      uint32_t lo = 0, hi = g_count;
      while (lo < hi) {
          uint32_t mid = lo + (hi - lo) / 2;
+         if (g_table[mid].addr == key) {
+-            g_hits++;
++            t_hits++;
++            e->addr = key; e->fn = g_table[mid].fn;
+             g_table[mid].fn();
+             return;
+         }
 diff --git a/src/hle_libc.c b/src/hle_libc.c
 index ffd29a0..d9693ae 100644
 --- a/src/hle_libc.c
@@ -574,6 +707,56 @@ index ffd29a0..d9693ae 100644
      if (d) memset(d, (int)(r1 & 0xFF), r2);
  }
  
+diff --git a/src/mem.c b/src/mem.c
+index d30f0b0..998b824 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -10,23 +10,45 @@
+ 
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(_WIN32)
++#include <windows.h>
++#endif
+ 
+ uint32_t vita_mem_bad_access;
+ 
+ static uint8_t *g_mem;
+ static uint32_t g_base;
+ static size_t   g_size;
++static int      g_virtual;   /* reservada con VirtualAlloc (MEM_WRITE_WATCH) */
+ 
+ int vita_mem_init(uint32_t base, size_t size) {
+     vita_mem_free();
++#if defined(_WIN32)
++    /* MLB 15 port (2026-11-08, PLAN_RENDIMIENTO.md fase 4b): with write watching the host can ask
++     * Windows which guest pages were written (GetWriteWatch) instead of re-hashing textures and
++     * buffers to find out. Same zeroed, committed memory as calloc gave. */
++    g_mem = (uint8_t *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
++    g_virtual = g_mem != NULL;
++    if (!g_mem) g_mem = (uint8_t *)calloc(size, 1);
++#else
+     g_mem = (uint8_t *)calloc(size, 1);
++#endif
+     if (!g_mem) return 1;
+     g_base = base;
+     g_size = size;
+     return 0;
+ }
+ 
++void vita_mem_window(uint8_t **mem, uint32_t *base, size_t *size) {
++    if (mem) *mem = g_mem;
++    if (base) *base = g_base;
++    if (size) *size = g_size;
++}
++
+ void vita_mem_free(void) {
++#if defined(_WIN32)
++    if (g_virtual) { if (g_mem) VirtualFree(g_mem, 0, MEM_RELEASE); g_mem = NULL; g_virtual = 0; }
++#endif
+     free(g_mem);
+     g_mem = NULL;
+     g_base = 0;
 diff --git a/src/trap.c b/src/trap.c
 index 4eb9ab7..91e191c 100644
 --- a/src/trap.c
@@ -642,14 +825,14 @@ index 24dc440..f90cc61 100644
 +/* vfp_s and fpscr_*: vita_cpu_state (cpu.h, cpu.c) */
  
  /* ARM's four comparison outcomes, written as the architecture defines them
-  * rather than derived from C's operators ΓÇö C has no way to express "unordered"
+  * rather than derived from C's operators — C has no way to express "unordered"
 diff --git a/tests/test_decode.c b/tests/test_decode.c
 index e2ce090..d3afa5e 100644
 --- a/tests/test_decode.c
 +++ b/tests/test_decode.c
 @@ -262,7 +262,123 @@ static void test_t32_operands(void) {
  
-     put16(0, 0xE8B1); put16(2, 0x0030);      /* ldm r1!, {r4,r5} ├óΓé¼ΓÇ¥ base r1 */
+     put16(0, 0xE8B1); put16(2, 0x0030);      /* ldm r1!, {r4,r5} â€” base r1 */
      in = dec(ARM_T32, BASE);
 -    assert(in.cls == A_LOADM && in.op == OP_NONE);
 +    assert(in.cls == A_LOADM && in.op == OP_LDM && in.rn == 1 && in.writeback && !in.ldm_db);
@@ -779,7 +962,7 @@ index e2ce090..d3afa5e 100644
 +    /* The same group with cond=0xD (LE), taken from MLB 15 at 0x813F7D56:
 +     * `ble.w 0x813F7B02`, 0x258 bytes backwards. The condition-space test used
 +     * to shift one bit too far, so 0xD looked like 111x and the instruction was
-+     * trapped as `sys` ΓÇö the program stopped there. */
++     * trapped as `sys` — the program stopped there. */
 +    put16(32, 0xF77F); put16(34, 0xAED4);
 +    in = dec(ARM_T32, BASE + 32);
 +    assert(in.cls == A_BRANCH && in.op == OP_B);
@@ -997,7 +1180,7 @@ index b14a48b..073d484 100644
      q->v[q->n].mode = mode;
      q->v[q->n].heur = heur;
      q->n++;
-+    extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA: direcci├│n a rastrear (0 = nada) */
++    extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA: dirección a rastrear (0 = nada) */
 +    if (g_dbg_trace_addr && addr == g_dbg_trace_addr)
 +        fprintf(stderr, "[sq] push %08X heur=%u n=%u\n", addr, heur, q->n);
  }
@@ -1080,7 +1263,7 @@ index b14a48b..073d484 100644
   *
 - * This is the evidence that turns a guess into a reading. Four adjacent words
 - * that are all Thumb-tagged, all correctly aligned, and all land inside a
-- * 5.6 MB window of a 4 GB space do not happen by accident ΓÇö the odds are
+- * 5.6 MB window of a 4 GB space do not happen by accident — the odds are
 - * around 1 in 10^13. Such a run is a POINTER TABLE, and knowing that is worth
 - * more than any property of the individual entries. */
 -#define SHAPE_RUN_MIN 4
@@ -1096,7 +1279,7 @@ index b14a48b..073d484 100644
 + * is the shape MLB 15 uses for its olSocial* classes, and at four entries the
 + * adjustor thunks in them were rejected: they begin with `sub.w r0, r0, #n`
 + * rather than a push, so they need the table to vouch for them. Missing one
-+ * is not a cosmetic gap ΓÇö the first virtual call on the object stops the
++ * is not a cosmetic gap — the first virtual call on the object stops the
 + * program (0x81C4AFE9 here). At three words the odds are still about 1 in
 + * 10^10 per position; a handful of false positives across a 15 MB image is
 + * possible, and each costs one dispatch slot, not correctness. */
@@ -1157,7 +1340,7 @@ index b14a48b..073d484 100644
 +         * A Thumb-tagged pointer that lands exactly on a decoded instruction
 +         * start is the strongest evidence this heuristic ever gets, and
 +         * skipping it left 206 of one title's 1,461 static constructors out of
-+         * the dispatch table ΓÇö each a trap when the startup code calls it. */
++         * the dispatch table — each a trap when the startup code calls it. */
 +        if (seen_get(r, t - base)) {
 +            sq_push(q, t, ARM_T32, 1);
 +            r->seeds_shape++;
@@ -1174,7 +1357,7 @@ index b14a48b..073d484 100644
 -         * missed is a run-time trap in a table the program walks at startup. */
 +         * missed is a run-time trap in a table the program walks at startup.
 +         *
-+         * Aceptamos tambi├⌐n `bx lr` (0x4770) como pr├│logo v├ílido para cubrir
++         * Aceptamos también `bx lr` (0x4770) como prólogo válido para cubrir
 +         * los stubs nulos de tablas virtuales (vtable thunks) que el juego
 +         * usa mucho y no empujan registros.
 +         */
@@ -1221,9 +1404,9 @@ index b14a48b..073d484 100644
 + *
 + * The second rule is what finds 0x8100AF4A: twenty-odd call sites form its
 + * address, but it starts with `movw r1, #...`, which no prologue test accepts.
-+ * A single reference without a prologue is still rejected ΓÇö movw/movt is also
++ * A single reference without a prologue is still rejected — movw/movt is also
 + * how a compiler forms the address of a constant, and .text holds its own
-+ * literal pools and strings ΓÇö and a multi-reference candidate must decode as
++ * literal pools and strings — and a multi-reference candidate must decode as
 + * at least a few Thumb instructions before it is believed.
 + *
 + * Targets are accepted with or without the Thumb bit: a function symbol is
@@ -1331,7 +1514,7 @@ index b14a48b..073d484 100644
 +            /* A literal pool between functions hides the previous one's
 +             * return (0x8101D339 sits after one). Then: decoding forward must
 +             * reach a return within 64 instructions through nothing
-+             * undecodable ΓÇö text almost never reads as that. */
++             * undecodable — text almost never reads as that. */
 +            if (!ok) {
 +                uint32_t o2 = t - base;
 +                for (int k = 0; k < 64 && o2 + 2 <= len; k++) {
@@ -1360,11 +1543,11 @@ index b14a48b..073d484 100644
      }
  }
  
-+/* Barrido de pr├│logos: funciones que nadie llama directamente y cuya direcci├│n
++/* Barrido de prólogos: funciones que nadie llama directamente y cuya dirección
 + * solo se construye en registros (p. ej. `movw r2, #0x9be5` ... `movt r1,
 + * #0x81af`, en registros distintos, que scan_movw_movt no empareja). En el
-+ * c├│digo que ning├║n recorrido ha decodificado, un `push {..., lr}` justo tras
-+ * el final de otra funci├│n es el principio de una funci├│n: 0x81AF9BE4 de MLB 15,
++ * código que ningún recorrido ha decodificado, un `push {..., lr}` justo tras
++ * el final de otra función es el principio de una función: 0x81AF9BE4 de MLB 15,
 + * a la que el juego salta al empezar el partido. Solo hasta `code_end`. */
 +static uint32_t prologue_scan(const vm_image *img, vf_result *r, seedq *q, uint32_t code_end) {
 +    const uint8_t *text = img->data + img->seg_file;
@@ -1388,8 +1571,8 @@ index b14a48b..073d484 100644
 +
 +/* Barrido de stubs: busca runs de 'bx lr' (0x4770) consecutivos en .text.
 + * Las vtables de MLB 15 contienen secuencias de stubs nulos (bx lr) separados
-+ * 2 bytes, y el primer stub de la secuencia no tiene puntero est├ítico que lo
-+ * apunte porque la vtable se parchea en tiempo de ejecuci├│n. */
++ * 2 bytes, y el primer stub de la secuencia no tiene puntero estático que lo
++ * apunte porque la vtable se parchea en tiempo de ejecución. */
 +static uint32_t stub_scan(const vm_image *img, vf_result *r, seedq *q) {
 +    const uint8_t *text = img->data + img->seg_file;
 +    const uint32_t base = img->seg_vaddr;
@@ -1401,11 +1584,11 @@ index b14a48b..073d484 100644
 +        uint16_t h = (uint16_t)(text[off] | ((uint16_t)text[off + 1] << 8));
 +        if (h != 0x4770) continue;  /* bx lr */
 +
-+        /* Medir cu├íntos bx lr consecutivos hay a partir de aqu├¡. */
++        /* Medir cuántos bx lr consecutivos hay a partir de aquí. */
 +        uint32_t run = 1;
 +        /* `run` cuenta instrucciones, y cada una ocupa 2 bytes. Medirlo en
-+         * bytes le├¡a 0x7047 (la mitad de un bx lr y la de otro): el run
-+         * siempre val├¡a 1 y este barrido no sembraba nada. */
++         * bytes leía 0x7047 (la mitad de un bx lr y la de otro): el run
++         * siempre valía 1 y este barrido no sembraba nada. */
 +        while (off + run * 2 + 2 <= len) {
 +            uint16_t h2 = (uint16_t)(text[off + run * 2] | ((uint16_t)text[off + run * 2 + 1] << 8));
 +            if (h2 != 0x4770) break;
@@ -1417,11 +1600,11 @@ index b14a48b..073d484 100644
 +            for (uint32_t i = 0; i < run; i++) {
 +                uint32_t t = base + off + i * 2;
 +                /* Aunque otro recorrido ya lo haya decodificado: decodificado no
-+                 * es registrado como funci├│n, y un thunk de vtable se llama por
++                 * es registrado como función, y un thunk de vtable se llama por
 +                 * puntero. FN_TEST evita duplicados al sacar la semilla. */
 +                {
 +                    sq_push(q, t, ARM_T32, 1);
-+                    r->seeds_shape++;  /* contamos como shape para estad├¡sticas */
++                    r->seeds_shape++;  /* contamos como shape para estadísticas */
 +                    found++;
 +                }
 +            }
@@ -1473,8 +1656,8 @@ index b14a48b..073d484 100644
 +     * data, and tables of pointers to strings there have the shape of Thumb
 +     * pointer tables whenever the strings sit at odd addresses. Walked as code
 +     * they produced 8,800 "functions" in MLB 15's rodata and 19 M bogus
-+     * instructions (the image no longer linked). Reliable starts ΓÇö call
-+     * targets and exports ΓÇö are dense through real code, so the code ends
++     * instructions (the image no longer linked). Reliable starts — call
++     * targets and exports — are dense through real code, so the code ends
 +     * before the first large gap between them. Thumb seeds past it are
 +     * dropped, reliable ones too: a walk that runs off the end of a function
 +     * into data decodes junk BLs there, and each "call target" in data walked
@@ -1513,10 +1696,10 @@ index b14a48b..073d484 100644
      shape_scan(img, out, &q);
 +
 +    /* 4b. Stub scan: runs de bx lr en .text que la shape scan no ve por falta
-+     * de punteros est├íticos (vtables parcheadas en runtime). */
++     * de punteros estáticos (vtables parcheadas en runtime). */
 +    stub_scan(img, out, &q);
 +
-+    /* 4c. Pr├│logos que nadie alcanz├│ (direcciones construidas en registros). */
++    /* 4c. Prólogos que nadie alcanzó (direcciones construidas en registros). */
 +    prologue_scan(img, out, &q, code_end);
 +
      head = before;
@@ -1532,7 +1715,7 @@ index fc81146..ec85c85 100644
 --- a/tools/armrecomp/analyze.h
 +++ b/tools/armrecomp/analyze.h
 @@ -52,6 +52,10 @@ typedef struct {
-      * than among instructions, which is a far better place to look ΓÇö merging
+      * than among instructions, which is a far better place to look — merging
       * the counts would hide which sweep is doing the work. */
      uint32_t seeds_shape_data;
 +    /* Addresses materialised as a movw/movt pair. A function reached only this
@@ -1594,7 +1777,7 @@ index fa3a6cd..dda43e2 100644
          o->sets_flags = 1;
          set(o, A_ALU, "shift");
 @@ -273,9 +306,11 @@ static void decode_t16(uint16_t h, arm_insn *o) {
-     /* 1100 L rn rlist ΓÇö LDM / STM */
+     /* 1100 L rn rlist — LDM / STM */
      if ((h & 0xF000) == 0xC000) {
          int load = (h & 0x0800) != 0;
 +        o->op = load ? OP_LDM : OP_STM;
@@ -1686,7 +1869,7 @@ index fa3a6cd..dda43e2 100644
 -            return 0;                              /* negated accumulate forms */
 +        case 0x1:
 +            /* VNMLS (op 0): d = n*m - d.  VNMLA (op 1): d = -(n*m) - d.
-+             * VNMUL is NOT here ΓÇö it is opc1 0x2 with op set. Decoding VNMLA
++             * VNMUL is NOT here — it is opc1 0x2 with op set. Decoding VNMLA
 +             * as VNMUL here, and VNMUL as VMUL below, flipped signs silently. */
 +            o->op = op ? OP_VNMLA : OP_VNMLS;
 +            set(o, A_ALU, op ? "vnmla" : "vnmls");
@@ -1821,7 +2004,7 @@ index fa3a6cd..dda43e2 100644
 +    }
 +
      /* Load/store DUAL. Bit 6 separates these from the multiple forms below, and
-      * the earlier mask excluded them by keeping that bit ΓÇö so every LDRD/STRD
+      * the earlier mask excluded them by keeping that bit — so every LDRD/STRD
       * fell through to unknown. They are common: compilers use them to move
 @@ -759,6 +908,9 @@ static void decode_t32(uint16_t h1, uint16_t h2, arm_insn *o) {
          o->imm = (uint32_t)(h2 & 0xFF) * 4u;   /* scaled by 4 */
@@ -1959,8 +2142,8 @@ index fa3a6cd..dda43e2 100644
 +    /* The field is three bits: 0 SXTH, 1 UXTH, 2 SXTB16, 3 UXTB16, 4 SXTB,
 +     * 5 UXTB. Indexing a four-entry table with `& 3` turned every UXTB.W
 +     * into UXTH and every SXTB.W into SXTH. The rotation (bits 5:4, in bytes)
-+     * selects which byte or halfword is extracted ΓÇö `uxtb.w r0, r4, ror #8`
-+     * is how compiled code reads byte 1 of a word ΓÇö and was ignored too.
++     * selects which byte or halfword is extracted — `uxtb.w r0, r4, ror #8`
++     * is how compiled code reads byte 1 of a word — and was ignored too.
 +     * With rn != 15 these are the extend-and-add forms (UXTAB, SXTAH...). */
 +    if ((h1 & 0xFF80) == 0xFA00 && (h2 & 0xF0C0) == 0xF080) {
 +        static const arm_op ex[8] = { OP_SXTH, OP_UXTH, OP_NONE, OP_NONE, OP_SXTB, OP_UXTB, OP_NONE, OP_NONE };
@@ -2085,7 +2268,7 @@ index 4630e94..1a8ab1e 100644
 +    OP_CLZ, OP_RBIT, OP_REV16, OP_REVSH,
 +    OP_TEQ,
  
-     /* Scalar VFP. Not vector work ΓÇö 82% of this platform's coprocessor traffic
+     /* Scalar VFP. Not vector work — 82% of this platform's coprocessor traffic
       * is ordinary floating point, and it maps onto C almost one to one. */
 @@ -81,6 +89,13 @@ typedef enum {
      OP_VLDM, OP_VSTM,   /* register-list float load/store, incl. VPUSH/VPOP */
@@ -2145,24 +2328,25 @@ index 4630e94..1a8ab1e 100644
 +
  #endif /* ARMRECOMP_DECODE_H */
 diff --git a/tools/armrecomp/emit.c b/tools/armrecomp/emit.c
-index 5fa36ab..fbee08f 100644
+index 5fa36ab..34bfe60 100644
 --- a/tools/armrecomp/emit.c
 +++ b/tools/armrecomp/emit.c
-@@ -17,10 +17,13 @@
+@@ -17,10 +17,14 @@
   */
  
  #include "emit.h"
++#include "neon_emit.h"
 +#include "../../include/vitarecomp/neon.h"     /* neon_kind, shared with the runtime */
  
  #include <stdlib.h>
  #include <string.h>
  
-+extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA (definida en main.c): depuraci├│n dirigida */
++extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA (definida en main.c): depuración dirigida */
 +
  #define MAX_INSNS_PER_FUNC 65536
  
  static const char *reg_name(int r) {
-@@ -78,7 +81,7 @@ static int fb_has_label(const fbody *b, uint32_t addr) {
+@@ -78,7 +82,7 @@ static int fb_has_label(const fbody *b, uint32_t addr) {
   * it is not a body.
   */
  
@@ -2171,7 +2355,7 @@ index 5fa36ab..fbee08f 100644
  
  typedef struct { uint32_t k[VISIT_SLOTS]; } visited;
  
-@@ -128,38 +131,190 @@ static int fs_has(const funcset *s, uint32_t addr) {
+@@ -128,38 +132,190 @@ static int fs_has(const funcset *s, uint32_t addr) {
      return 0;
  }
  
@@ -2213,12 +2397,12 @@ index 5fa36ab..fbee08f 100644
 +/* How far a function's walk may treat code as its own.
 + *
 + * A function registered because something called it may have been walked by
-+ * discovery only briefly ΓÇö its recorded extent can be zero or tiny. The body is
++ * discovery only briefly — its recorded extent can be zero or tiny. The body is
 + * still real, so fall back to a generous bound and let control flow terminate
 + * the walk, which it does at the first return.
 + *
 + * Discovery's extent is where ITS walk stopped, and that walk stops at anything
-+ * another function's walk already decoded ΓÇö so a long function whose epilogue
++ * another function's walk already decoded — so a long function whose epilogue
 + * is shared by many paths can come out cut short. Functions are laid out
 + * contiguously, so the code up to the next function start past the extent
 + * still belongs to this one (stray starts inside the body do not count).
@@ -2235,13 +2419,13 @@ index 5fa36ab..fbee08f 100644
 +
 +/* Walk one function's body.
 + *
-+ * Flow that leaves `bound` either reaches a known function ΓÇö a tail call ΓÇö or
++ * Flow that leaves `bound` either reaches a known function — a tail call — or
 + * code that belongs to no known function. Following that code inline copied it
 + * into every function that reached it: the output grew from 14.5 M to 24 M
 + * instructions and the build from 4 to 15 minutes. Instead it is PROMOTED: with
 + * `pend` set (the pre-pass) the address is recorded and becomes a function of
 + * its own, emitted once, and the branch or fall-through to it is a tail call.
-+ * Entering guest code at any instruction boundary through a C call is sound ΓÇö
++ * Entering guest code at any instruction boundary through a C call is sound —
 + * registers and stack are guest state, and its return returns for us.
 + *
 + * `known` must be the final function set in the emit pass; then no promotion
@@ -2255,7 +2439,7 @@ index 5fa36ab..fbee08f 100644
      memset(&seen, 0, sizeof(seen));
  
 -    /* A function registered because something called it may have been walked
--     * by discovery only briefly ΓÇö its recorded extent can be zero or tiny. The
+-     * by discovery only briefly — its recorded extent can be zero or tiny. The
 -     * body is still real, so fall back to a generous bound and let control flow
 -     * terminate the walk, which it does at the first return. Extent is a
 -     * safety limit here, not the definition of the body. */
@@ -2292,19 +2476,19 @@ index 5fa36ab..fbee08f 100644
 +            } else {
 +                extern uint32_t g_dbg_trace_addr;
 +                if (g_dbg_trace_addr && (a == g_dbg_trace_addr || a + 2 == g_dbg_trace_addr || a + 4 == g_dbg_trace_addr))
-+                    fprintf(stderr, "[collect] %08X YA EMITIDO aqu├¡ paro\n", a);
++                    fprintf(stderr, "[collect] %08X YA EMITIDO aquí paro\n", a);
 +                break;        /* already emitted */
 +            }
 +
 +            /* Past the extent, flow that reaches a known function start is a
 +             * fall-through into it: emit it as an explicit tail call. Stopping
-+             * there silently instead ended the C function ΓÇö a `return` the
++             * there silently instead ended the C function — a `return` the
 +             * guest never executed. Anywhere else past the extent is still this
 +             * function's code (the extent is cut short by stray starts). */
 +            /* A REAL function start (a call target or export, not a shape guess)
 +             * reached inside the bound is another function: discovery's extent
 +             * routinely spans several, and walking into them copied each one
-+             * into every function whose extent covered it ΓÇö 3.7 copies of every
++             * into every function whose extent covered it — 3.7 copies of every
 +             * instruction on average. Shape-heuristic starts are still walked
 +             * through: they can sit inside a loop, and splitting there would
 +             * make every iteration a nested C call. */
@@ -2374,14 +2558,14 @@ index 5fa36ab..fbee08f 100644
  
              /* `bound`, not `fn->end`.
               *
-@@ -176,9 +331,24 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
+@@ -176,9 +332,24 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
               * trapped: 2,547 instructions, and every one of them an ordinary
               * intra-function branch that had already been translated correctly
               * a few lines above. */
 +            /* Past the bound, a branch to a known function start is a tail
 +             * call and the emitter calls it. A branch anywhere else is still
-+             * this function's code ΓÇö the bound was cut short by a stray start
-+             * inside the body (shape heuristics find many) ΓÇö so it is followed
++             * this function's code — the bound was cut short by a stray start
++             * inside the body (shape heuristics find many) — so it is followed
 +             * too, within 64 KB, rather than left to trap. */
 +            int near = in.has_target && in.target + 0x10000u > fn->addr &&
 +                       in.target < fn->addr + 0x10000u &&
@@ -2400,7 +2584,7 @@ index 5fa36ab..fbee08f 100644
                  if (sp_ < (int)(sizeof(stack) / sizeof(stack[0])))
                      stack[sp_++] = in.target;
                  if (!in.conditional) break;          /* flow ends here */
-@@ -214,13 +384,15 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
+@@ -214,13 +385,15 @@ static void collect(const vm_image *img, const vf_func *fn, fbody *b) {
      uint32_t kept = 0;
      for (uint32_t i = 0; i < b->nlabels; i++) {
          int placed = 0;
@@ -2418,7 +2602,7 @@ index 5fa36ab..fbee08f 100644
      }
      b->nlabels = kept;
  }
-@@ -274,6 +446,10 @@ static void operand2(char *dst, size_t cap, const arm_insn *in) {
+@@ -274,6 +447,10 @@ static void operand2(char *dst, size_t cap, const arm_insn *in) {
          return;
      }
      if (in->rm == 15) { reg_operand(dst, cap, 15, in); return; }
@@ -2429,7 +2613,7 @@ index 5fa36ab..fbee08f 100644
      static const char *fn[4] = { "vita_lsl", "vita_lsr", "vita_asr", "vita_ror" };
      snprintf(dst, cap, "%s(%s, %u)", fn[in->shift_type & 3],
               src_name(in, in->rm), in->shift_amt);
-@@ -300,9 +476,16 @@ static int address(char *dst, size_t cap, const arm_insn *in) {
+@@ -300,9 +477,16 @@ static int address(char *dst, size_t cap, const arm_insn *in) {
      /* The U bit is not decoration: the T32 8-bit form encodes [rN, #-imm]
       * with the same fields as the positive one, so ignoring it reads from the
       * wrong side of the base register. */
@@ -2447,7 +2631,7 @@ index 5fa36ab..fbee08f 100644
      else if (in->rm != ARM_NO_REG)
          snprintf(dst, cap, "%s + %s", src_name(in, in->rn), src_name(in, in->rm));
      else
-@@ -353,6 +536,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -353,6 +537,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
                       const arm_insn *in, FILE *f, emit_stats *st) {
      char o2[64], addr[64], rn_s[32];
  
@@ -2465,7 +2649,7 @@ index 5fa36ab..fbee08f 100644
      /* The first operand, with r15 resolved. Computed once because several
       * paths below need it and the ternary for "rn defaults to rd" is easy to
       * get inconsistently wrong when repeated. */
-@@ -417,6 +611,21 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -417,6 +612,21 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
          guarded = 1;
      }
  
@@ -2487,7 +2671,7 @@ index 5fa36ab..fbee08f 100644
      int ok = 1;
      switch (in->op) {
          case OP_MOV:
-@@ -476,7 +685,11 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -476,7 +686,11 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
          }
  
          case OP_RSB:
@@ -2500,7 +2684,7 @@ index 5fa36ab..fbee08f 100644
              fprintf(f, "      %s = _a - _b;\n", reg_name(in->rd));
              if (in->sets_flags)
                  fprintf(f, "      vita_flags_sub(_a, _b, %s);\n", reg_name(in->rd));
-@@ -499,20 +712,34 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -499,20 +713,34 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              static const char *fn2[4] = { "vita_lsl", "vita_lsr", "vita_asr", "vita_ror" };
              int which = in->op == OP_LSL ? 0 : in->op == OP_LSR ? 1
                        : in->op == OP_ASR ? 2 : 3;
@@ -2544,7 +2728,7 @@ index 5fa36ab..fbee08f 100644
              if (in->sets_flags) fprintf(f, "    vita_flags_nz(%s);\n", reg_name(in->rd));
              break;
  
-@@ -525,10 +752,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -525,10 +753,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
                      in->op == OP_CMP ? '-' : '+');
              break;
  
@@ -2558,7 +2742,7 @@ index 5fa36ab..fbee08f 100644
              break;
  
          case OP_ADR:
-@@ -544,10 +771,16 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -544,10 +772,16 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
               * code later. */
              if (in->rn == 15) {
                  uint32_t pc = (in->addr + 4) & ~3u;
@@ -2578,7 +2762,7 @@ index 5fa36ab..fbee08f 100644
                      fprintf(f, "    %s = 0x%08X;  /* literal */\n", reg_name(in->rt), v);
                      st->literals++;
                      break;
-@@ -558,6 +791,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -558,6 +792,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
                             : in->op == OP_LDRH  ? "vita_read16(%s)"
                             : in->op == OP_LDRSB ? "vita_sxtb(vita_read8(%s))"
                                                  : "vita_sxth(vita_read16(%s))";
@@ -2596,7 +2780,7 @@ index 5fa36ab..fbee08f 100644
              fprintf(f, "    %s = ", reg_name(in->rt));
              fprintf(f, rd, addr);
              fprintf(f, ";\n");
-@@ -580,13 +824,20 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -580,13 +825,20 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              char base[64];
              if (!address(base, sizeof(base), in)) { ok = 0; trap(f, in, "ldrd/strd addr"); break; }
  
@@ -2621,7 +2805,7 @@ index 5fa36ab..fbee08f 100644
              break;
          }
  
-@@ -594,7 +845,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -594,7 +846,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              if (!address(addr, sizeof(addr), in)) { ok = 0; trap(f, in, "store addr"); break; }
              const char *w = in->op == OP_STR ? "vita_write32"
                            : in->op == OP_STRB ? "vita_write8" : "vita_write16";
@@ -2638,7 +2822,7 @@ index 5fa36ab..fbee08f 100644
              break;
          }
  
-@@ -637,7 +896,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -637,7 +897,15 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              const char *fn3 = in->op == OP_SXTB ? "vita_sxtb"
                              : in->op == OP_SXTH ? "vita_sxth"
                              : in->op == OP_UXTB ? "vita_uxtb" : "vita_uxth";
@@ -2655,7 +2839,7 @@ index 5fa36ab..fbee08f 100644
              break;
          }
  
-@@ -645,6 +912,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -645,6 +913,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              fprintf(f, "    %s = vita_rev(%s);\n", reg_name(in->rd), src_name(in, in->rm));
              break;
  
@@ -2668,7 +2852,7 @@ index 5fa36ab..fbee08f 100644
          case OP_SBFX: case OP_UBFX:
              fprintf(f, "    %s = %s(%s, %u, %u);\n", reg_name(in->rd),
                      in->op == OP_SBFX ? "vita_sbfx" : "vita_ubfx",
-@@ -670,6 +943,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -670,6 +944,10 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              break;
  
          case OP_B:
@@ -2679,7 +2863,7 @@ index 5fa36ab..fbee08f 100644
              if (fb_has_label(b, in->target)) {
                  if (in->cond == ARM_COND_AL) fprintf(f, "    goto L_%08X;\n", in->target);
                  else fprintf(f, "    if (vita_cond(%u)) goto L_%08X;\n",
-@@ -700,6 +977,13 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -700,6 +978,13 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
               * translation. BX is a tail transfer and does not come back; BLX is
               * a call and does. */
              if (in->rm == ARM_NO_REG) { ok = 0; break; }
@@ -2692,8 +2876,8 @@ index 5fa36ab..fbee08f 100644
 +            }
              /* Through reg_operand, not reg_name. `bx pc` is a real (if odd)
               * instruction, and as a SOURCE the PC is a constant this pass
-              * knows ΓÇö resolving it is correct where naming it would not
-@@ -795,9 +1079,9 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+              * knows — resolving it is correct where naming it would not
+@@ -795,9 +1080,9 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              for (uint32_t k = 0; k < words; k++) {
                  int reg = (in->vfp_dp ? in->vd * 2 : in->vd) + (int)k;
                  if (in->op == OP_VLDM)
@@ -2705,7 +2889,7 @@ index 5fa36ab..fbee08f 100644
              }
              if (in->mem_add && in->writeback)
                  fprintf(f, "    %s += %u;\n", rn, words * 4);
-@@ -816,6 +1100,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -816,6 +1101,17 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              break;
          }
  
@@ -2723,7 +2907,7 @@ index 5fa36ab..fbee08f 100644
          case OP_VNMUL:
              if (in->vd == ARM_NO_REG || in->vn == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
              if (in->vfp_dp)
-@@ -835,8 +1130,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -835,8 +1131,12 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
              /* Clearing the sign bit rather than calling fabs: it is the
               * architecture's definition, and it preserves NaN payloads where
               * a library call need not. */
@@ -2738,7 +2922,7 @@ index 5fa36ab..fbee08f 100644
              else            fprintf(f, "    vfp_setu(%d, vfp_getu(%d) & 0x7FFFFFFFu);\n", in->vd, in->vm);
              break;
  
-@@ -880,18 +1179,154 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -880,18 +1180,154 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
  
          case OP_VCVT_I2F:
              if (in->vd == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
@@ -2798,7 +2982,7 @@ index 5fa36ab..fbee08f 100644
 +
          case OP_VCVT_F2I:
              if (in->vd == ARM_NO_REG || in->vm == ARM_NO_REG) { ok = 0; break; }
-             /* Toward zero, which is what a C cast does ΓÇö the only rounding
+             /* Toward zero, which is what a C cast does — the only rounding
               * mode claimed by the decoder for exactly that reason. */
 -            fprintf(f, "    vfp_setu(%d, (uint32_t)(%s)vfp_getf(%d));\n",
 -                    in->vd, in->vfp_unsigned ? "uint32_t" : "int32_t", in->vm);
@@ -2897,7 +3081,7 @@ index 5fa36ab..fbee08f 100644
          case OP_NOP:
              fprintf(f, "    /* nop */\n");
              break;
-@@ -923,6 +1358,39 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -923,6 +1359,41 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
          } else if (in->cls == A_CALL || in->cls == A_INDIRECT) {
              fprintf(f, "    vita_trap_indirect(0x%08X, 0);\n", in->addr);
              note_trap(st, "indirect transfer");
@@ -2907,7 +3091,9 @@ index 5fa36ab..fbee08f 100644
 +            int rt = (int)((h2 >> 12) & 15), rn = (int)(h1 & 15), rm = (int)(h2 & 15);
 +            switch (neon_kind(in->raw)) {
 +                case 1:
-+                    fprintf(f, "    neon_dp(0x%08Xu, 0x%08Xu);\n", in->addr, in->raw);
++                    /* the busiest forms as plain C (neon_emit.h); the rest from the encoding */
++                    if (!getenv("ARMRECOMP_NEON_RUNTIME") && neon_emit_inline(f, in->raw)) st->neon_inline++;
++                    else fprintf(f, "    neon_dp(0x%08Xu, 0x%08Xu);\n", in->addr, in->raw);
 +                    ok = 1;
 +                    break;
 +                case 2:
@@ -2937,7 +3123,7 @@ index 5fa36ab..fbee08f 100644
          } else if (in->cls == A_SIMD) {
              trap(f, in, "simd");
              note_trap(st, "simd/vfp");
-@@ -932,6 +1400,7 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
+@@ -932,6 +1403,7 @@ static int emit_insn(const vm_image *img, const vm_module *mod, const nid_db *db
          }
      }
  
@@ -2945,7 +3131,7 @@ index 5fa36ab..fbee08f 100644
      if (guarded) fprintf(f, "    }\n");
      return ok;
  }
-@@ -956,6 +1425,83 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+@@ -956,6 +1428,83 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
      for (uint32_t i = 0; i < disc->count; i++) fs.v[i] = disc->funcs[i].addr;
      qsort(fs.v, fs.n, sizeof(uint32_t), fs_cmp);
  
@@ -3029,7 +3215,7 @@ index 5fa36ab..fbee08f 100644
      fprintf(f, "/* Generated by armrecomp. Do not edit.\n");
      fprintf(f, " *\n");
      fprintf(f, " * module: %s\n", mod->info.name);
-@@ -980,8 +1526,8 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+@@ -980,8 +1529,8 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
  
      /* Forward declarations: the call graph has cycles, so every function must
       * be visible before any body is emitted. */
@@ -3040,7 +3226,7 @@ index 5fa36ab..fbee08f 100644
      fprintf(f, "\n");
  
      /* A limited emit still references functions it did not emit, so those get
-@@ -995,11 +1541,12 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+@@ -995,11 +1544,12 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
          fprintf(f, "\n");
      }
  
@@ -3056,7 +3242,7 @@ index 5fa36ab..fbee08f 100644
  
          fprintf(f, "/* ---------------------------------------------------------------\n");
          fprintf(f, " * vita_func_%08X  --  %u instructions, %u bytes%s\n",
-@@ -1008,8 +1555,36 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+@@ -1008,8 +1558,36 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
          fprintf(f, " * ------------------------------------------------------------- */\n");
          fprintf(f, "void vita_func_%08X(void) {\n", fn->addr);
  
@@ -3093,7 +3279,7 @@ index 5fa36ab..fbee08f 100644
              if (fb_has_label(&b, in->addr))
                  fprintf(f, "L_%08X:\n", in->addr);
  
-@@ -1139,9 +1714,26 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+@@ -1139,9 +1717,26 @@ int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
      fprintf(f, "void vita_register_functions(void) {\n");
      fprintf(f, "    vita_dispatch_init(vita_functions,\n");
      fprintf(f, "        (uint32_t)(sizeof(vita_functions) / sizeof(vita_functions[0])));\n");
@@ -3122,10 +3308,10 @@ index 5fa36ab..fbee08f 100644
  }
  
 diff --git a/tools/armrecomp/emit.h b/tools/armrecomp/emit.h
-index 2627904..e20107f 100644
+index 2627904..8f96ba4 100644
 --- a/tools/armrecomp/emit.h
 +++ b/tools/armrecomp/emit.h
-@@ -26,7 +26,11 @@ typedef struct {
+@@ -26,7 +26,12 @@ typedef struct {
      uint32_t insns;
      uint32_t translated;   /* emitted as real C            */
      uint32_t trapped;      /* emitted as a named trap      */
@@ -3133,12 +3319,13 @@ index 2627904..e20107f 100644
      uint32_t literals;     /* literal-pool loads folded to constants */
 +    uint32_t promoted;     /* off-bound code made a function of its own  */
 +    uint32_t neon;         /* NEON instructions handed to the runtime    */
++    uint32_t neon_inline;  /* of those, written out as C (neon_emit.h)   */
 +    uint32_t varrefs;      /* MOVW/MOVT relocated to an imported variable */
      uint32_t import_calls; /* call sites bound to a firmware import  */
      uint32_t imports_used; /* distinct imports actually reached      */
  
 diff --git a/tools/armrecomp/main.c b/tools/armrecomp/main.c
-index dda0a2e..51a6b89 100644
+index dda0a2e..e9617cb 100644
 --- a/tools/armrecomp/main.c
 +++ b/tools/armrecomp/main.c
 @@ -688,6 +688,8 @@ static int cmd_discover(const char *path) {
@@ -3150,11 +3337,12 @@ index dda0a2e..51a6b89 100644
      printf("  pointer shape       %u  (heuristic; %u candidates rejected)\n",
             r.seeds_shape, r.rejected_shape);
      printf("    of which in .text %u\n", r.seeds_shape - r.seeds_shape_data);
-@@ -776,7 +778,12 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
+@@ -776,7 +778,13 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
             st.insns ? 100.0 * st.translated / st.insns : 0.0);
      printf("  trapped       %u  (%.2f%%)\n", st.trapped,
             st.insns ? 100.0 * st.trapped / st.insns : 0.0);
 +    printf("  overlaps      %u  fall-throughs fixed past overlapping decodes\n", st.overlaps);
++    printf("  neon inline   %u of %u NEON written out as C\n", st.neon_inline, st.neon);
      printf("  literals      %u  folded to constants\n", st.literals);
 +    printf("  promoted      %u  shared code emitted once as its own function\n", st.promoted);
 +    printf("  neon          %u  executed by the runtime from the encoding\n", st.neon);
@@ -3163,11 +3351,11 @@ index dda0a2e..51a6b89 100644
      printf("  import calls  %u  bound to firmware\n", st.import_calls);
      if (st.stub_shadowed)
          printf("  stubs shadowed %u  discovered as functions, routed as imports\n",
-@@ -828,7 +835,13 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
+@@ -828,7 +836,13 @@ static int cmd_emit(const char *path, const char *outpath, uint32_t limit,
      return 0;
  }
  
-+uint32_t g_dbg_trace_addr;   /* VITA_DBGA: direcci├│n a rastrear (0 = nada) */
++uint32_t g_dbg_trace_addr;   /* VITA_DBGA: dirección a rastrear (0 = nada) */
 +
  int main(int argc, char **argv) {
 +    {
@@ -3216,7 +3404,7 @@ index 8a02d83..cbfa353 100644
 +    /* --- imported variables --------------------------------------------- */
 +    /*
 +     * Each variable's entry points at its reference list: a header word whose
-+     * bits 31-8 count the MOVW/MOVT pairs, then two words per reference ΓÇö
++     * bits 31-8 count the MOVW/MOVT pairs, then two words per reference —
 +     * relocation type in bits 15-8 (0x2F R_ARM_THM_MOVW_ABS_NC, 0x30
 +     * R_ARM_THM_MOVT_ABS) and the instruction's offset from segment 0.
 +     */
@@ -3319,7 +3507,7 @@ index 04570d4..dbf4df4 100644
 + * loader's job here instead: each variable gets a CELL in guest memory, every
 + * referencing MOVW/MOVT is emitted with the cell's address, and the host fills
 + * the cell. Left unresolved, the pairs keep the linker's placeholder and the
-+ * module reads whatever bytes are there ΓÇö which is how a path came out as
++ * module reads whatever bytes are there — which is how a path came out as
 + * "CONF$G_r$$N.TXT": toupper through a table that was never there. */
 +#define VM_VAR_CELL_BASE 0x82080000u   /* after the ELF, before the libc heap */
 +#define VM_VAR_CELL_SIZE 32u

@@ -22,9 +22,30 @@
 
 #include "vitarecomp/cpu.h"
 #include "recompilar.h"
+#include <intrin.h>
+
+/* Huella del procesador (PLAN_RENDIMIENTO.md fase 2): juego.dll se compila con -march=native, así
+ * que solo vale para este modelo de CPU. Si se copia la carpeta a otro PC la huella no coincide y
+ * se vuelve a preparar (si no, un procesador más viejo se cerraría con una instrucción ilegal). */
+static uint32_t cpu_huella(char *marca, size_t max) {
+    int r[4]; char b[49] = { 0 };
+    __cpuid(r, 0x80000000);
+    if ((unsigned)r[0] >= 0x80000004u) {
+        for (int i = 0; i < 3; i++) { __cpuid(r, 0x80000002 + i); memcpy(b + 16 * i, r, 16); }
+    }
+    uint32_t h = 2166136261u;
+    for (const char *c = b; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    __cpuid(r, 1); h = (h ^ (uint32_t)r[0]) * 16777619u;      /* familia/modelo/stepping */
+    __cpuidex(r, 7, 0); h = (h ^ (uint32_t)r[1]) * 16777619u;  /* AVX2, BMI, AVX-512... */
+    if (marca) { const char *c = b; while (*c == ' ') c++; snprintf(marca, max, "%s", c); }
+    return h;
+}
 
 /* Cambiar si cambia lo que el exe espera del DLL (exports, vita_cpu_state, flags). */
-#define RECOMP_VERSION 3   /* 3: armrecomp con caídas tras decodificaciones solapadas (2026-11-07) */
+#define RECOMP_VERSION 6   /* 3: armrecomp con caídas tras decodificaciones solapadas (2026-11-07)
+                            * 4: memoria de la Vita en línea, VITA_MEM_DIRECTA (2026-11-08)
+                            * 5: -march=native, huella con el procesador (2026-11-08)
+                            * 6: NEON frecuente escrito en C (neon_emit.h) y -ffp-contract=off (2026-11-08) */
 #define MB_POR_PARTE   12          /* trozos pequeños: menos memoria por clang */
 
 /* ------------------------------------------------------------------------------------------ */
@@ -398,7 +419,8 @@ static int trabajo(void) {
     if (hilos > 32) hilos = 32;
     printf("[recompilar] %d trozos, %d a la vez (%lu núcleos, %llu MB libres)\n", total, hilos, si.dwNumberOfProcessors, ms.ullAvailPhys >> 20);
     const char *flags = "--target=x86_64-pc-windows-msvc -fms-compatibility-version=19.20 -O2 -ffreestanding -nostdinc "
-                        "-fno-stack-protector -mno-stack-arg-probe -msse4.1 -fno-math-errno -fasynchronous-unwind-tables -w";
+                        "-fno-stack-protector -mno-stack-arg-probe -msse4.1 -fno-math-errno -fasynchronous-unwind-tables -w "
+                        "-DVITA_MEM_DIRECTA -march=native -ffp-contract=off";   /* sin FMA: la Vita redondea mul y add por separado */
     HANDLE act[32]; int act_i[32], nact = 0, sig = 0, hechos = 0;
     while (hechos < total) {
         while (nact < hilos && sig < total && !g_cancelar) {
@@ -563,7 +585,8 @@ int recompilar_si_hace_falta(const char *exe_dir, const char *elf, char *dll_out
     char exe[MAX_PATH], *base;
     GetModuleFileNameA(NULL, exe, sizeof(exe));
     base = strrchr(exe, '\\'); base = base ? base + 1 : exe;
-    snprintf(g_huella, sizeof(g_huella), "v%d cpu%u elf %lld %08X exe %s", RECOMP_VERSION, (unsigned)sizeof(vita_cpu_state), tam, crc, base);
+    snprintf(g_huella, sizeof(g_huella), "v%d cpu%u elf %lld %08X exe %s proc %08X", RECOMP_VERSION, (unsigned)sizeof(vita_cpu_state), tam, crc, base,
+             cpu_huella(NULL, 0));
     if (ya_esta()) return 0;
     if (getenv("MLB15_SIN_RECOMPILAR")) return existe(g_dll) ? 0 : -1;
 

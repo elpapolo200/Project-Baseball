@@ -11,4 +11,5 @@ extern const vita_import_var *juego_import_vars;
 extern uint32_t juego_import_var_count;
 
 int juego_cargar(const char *ruta);
+void juego_memoria(void);   /* tras vita_mem_init: el DLL accede a la memoria en línea */
 #endif

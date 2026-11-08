@@ -45,9 +45,10 @@ $sdl = Join-Path $deps 'sdl2\SDL2-2.32.10'
 $sdlinc = Join-Path $sdl 'include'
 $sdllib = Join-Path $sdl 'lib\x64'
 
-# Compilar recurso .rc (icono + versión)
+# Compilar recurso .rc (icono + versión). (Hasta la v0.2.0 la orden llevaba otra vez $vcvars sin comillas,
+# fallaba en silencio y se enlazaba el .res viejo.)
 Push-Location (Join-Path $root 'host')
-$rc = "$vcvars >nul 2>&1 && rc /nologo /I`"$inc`" /I`"$vkinc`" /I`"$sdlinc`" mlb15.rc"
+$rc = "rc /nologo /I`"$inc`" /I`"$vkinc`" /I`"$sdlinc`" mlb15.rc"
 Invoke-VS $rc
 Pop-Location
 
